@@ -206,10 +206,15 @@ def test_poller_leaves_stopped_or_explicitly_paused_player_idle(status, same_tra
             ),
             patch.object(poller, "_advance_queue", new=AsyncMock()) as advance,
             patch.object(poller, "_adopt_external_track") as adopt,
+            patch.object(poller, "_update_session_status") as update_status,
         ):
             settings.PLAYBACK_POLL_INTERVAL_SECONDS = 0
             await poller._poll_loop(session.room_id, uuid4())
             advance.assert_not_awaited()
             adopt.assert_not_called()
+            if status == ItemStatus.PAUSED and same_track:
+                update_status.assert_called_once_with(session.id, ItemStatus.PAUSED, 0)
+            else:
+                update_status.assert_not_called()
 
     anyio.run(run)

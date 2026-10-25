@@ -1,5 +1,6 @@
 """Spotify device recovery preserves authorization, queue order and permissions."""
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -8,9 +9,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from backend.adapters.spotify_playback_adapter import SpotifyPlaybackAdapter
+from backend.adapters.spotify_playback_adapter import (
+    SpotifyPlaybackAdapter,
+    SpotifyPlaybackState,
+)
 from backend.api.auth.dependencies import get_current_user
 from backend.api.playback.dependencies import get_playback_control_service
+from backend.core.exceptions import SpotifyConnectionRequiredException
 from backend.core.security import SecurityService
 from backend.db.models import Room, User
 from backend.db.models.enum import ItemStatus
@@ -347,5 +352,225 @@ def test_poller_renews_an_early_rejected_token_before_retrying_playback_state():
             assert get_token.await_count == 2
             assert get_token.await_args_list[1].kwargs == {"force_refresh": True}
             renewed.get_current_playback.assert_awaited_once()
+
+    anyio.run(run)
+
+
+def test_pause_and_external_resume_reset_the_elapsed_time_baseline():
+    """Elapsed time is added once after a device disconnect and external resume."""
+    original_start = datetime(2026, 10, 25, 12, 0)
+    resumed_at = original_start + timedelta(minutes=2)
+    session = Session(
+        room_id=uuid4(),
+        current_song_id="first",
+        playback_status=ItemStatus.PLAYING,
+        playback_started_at=original_start,
+        playback_position_ms=30000,
+    )
+    repo = MagicMock()
+    repo.get_by_id.return_value = session
+
+    def save(_session_id, data):
+        for key, value in data.items():
+            setattr(session, key, value)
+
+    repo.update.side_effect = save
+    with (
+        patch("backend.services.playback_poller_service.DBSession"),
+        patch(
+            "backend.services.playback_poller_service.SessionRepository",
+            return_value=repo,
+        ),
+        patch("backend.services.playback_poller_service.QueueRepository") as queue_type,
+        patch("backend.services.playback_poller_service.datetime") as clock,
+    ):
+        queue_type.return_value.get_first_item.return_value = None
+        poller = PlaybackPollerService()
+        poller._update_session_status(session.id, ItemStatus.PAUSED, 90000)
+        assert session.playback_started_at is None
+        assert session.playback_position_ms == 90000
+
+        # The browser reports its actual position after reconnecting and resuming.
+        clock.now.return_value = resumed_at.replace(tzinfo=timezone.utc)
+        poller._update_session_status(session.id, ItemStatus.PLAYING, 95000)
+        assert session.playback_started_at == resumed_at
+        assert session.current_song_id == "first"
+        estimated_position = session.playback_position_ms + int(
+            (
+                resumed_at + timedelta(seconds=10) - session.playback_started_at
+            ).total_seconds()
+            * 1000
+        )
+        assert estimated_position == 105000
+        assert estimated_position < 180000
+
+
+def test_oauth_required_event_routes_by_type_and_only_targets_current_managers():
+    """The frontend receives its subscribed type without exposing status to members."""
+    room_id = uuid4()
+    host = User(username="host", room_id=room_id)
+    admin = User(username="admin", room_id=room_id)
+    member = User(username="member", room_id=room_id)
+    departed_admin = User(username="departed", room_id=uuid4())
+    room = Room(
+        id=room_id,
+        room_name="Music",
+        room_code="ABCDEF",
+        host_user_id=host.id,
+        settings={"admin_user_ids": [str(admin.id), str(departed_admin.id)]},
+    )
+    room.users = [host, admin, member, departed_admin]
+    poller = PlaybackPollerService()
+
+    async def run():
+        with (
+            patch("backend.services.playback_poller_service.settings") as config,
+            patch("backend.services.playback_poller_service.DBSession"),
+            patch("backend.services.playback_poller_service.RoomRepository") as rooms,
+            patch.object(
+                poller, "_get_session_state", return_value=Session(room_id=room_id)
+            ),
+            patch.object(
+                poller,
+                "_get_valid_token",
+                new=AsyncMock(side_effect=SpotifyConnectionRequiredException()),
+            ),
+            patch(
+                "backend.services.playback_poller_service.manager.broadcast_to_users",
+                new=AsyncMock(),
+            ) as targeted,
+            patch(
+                "backend.services.playback_poller_service.manager.broadcast",
+                new=AsyncMock(),
+            ) as public,
+        ):
+            config.PLAYBACK_POLL_INTERVAL_SECONDS = 0
+            rooms.return_value.get_by_id.return_value = room
+            await poller._poll_loop(room_id, host.id)
+            targeted.assert_awaited_once_with(
+                {
+                    "type": "oauth_required",
+                    "code": "oauth_required",
+                    "message": "Host must connect their streaming account",
+                    "room_id": str(room_id),
+                },
+                str(room_id),
+                {host.id, admin.id},
+            )
+            public.assert_not_awaited()
+
+    anyio.run(run)
+
+
+def test_retained_paused_spotify_track_cannot_consume_newly_started_queue_item():
+    """A Play 204 can precede web-player activation and still return the old track."""
+    session = Session(
+        room_id=uuid4(),
+        playback_status=ItemStatus.PLAYING,
+        current_song_id="queued-first",
+        playback_position_ms=0,
+        playback_started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+    )
+    current_item = MagicMock()
+    current_item.song.external_id = "queued-first"
+    adapter = AsyncMock()
+    adapter.get_current_playback.return_value = SpotifyPlaybackState(
+        is_playing=False,
+        track_id="old-paused-track",
+        progress_ms=0,
+        duration_ms=180000,
+        device_id="browser",
+    )
+    poller = PlaybackPollerService()
+
+    async def run():
+        with (
+            patch("backend.services.playback_poller_service.settings") as config,
+            patch(
+                "backend.services.playback_poller_service.SpotifyPlaybackAdapter",
+                return_value=adapter,
+            ),
+            patch.object(
+                poller, "_get_session_state", side_effect=[session, session, None]
+            ),
+            patch.object(
+                poller, "_get_valid_token", new=AsyncMock(return_value="token")
+            ),
+            patch.object(poller, "_get_current_queue_item", return_value=current_item),
+            patch.object(poller, "_get_next_queue_item", return_value=None),
+            patch.object(
+                poller, "_build_playback_service_with_queue"
+            ) as build_playback,
+            patch.object(poller, "_update_session_status") as update,
+            patch.object(poller, "_broadcast_state_changed", new=AsyncMock()) as notify,
+            patch.object(poller, "_adopt_external_track") as adopt,
+            patch.object(poller, "_advance_queue", new=AsyncMock()) as advance,
+        ):
+            config.PLAYBACK_POLL_INTERVAL_SECONDS = 0
+            await poller._poll_loop(session.room_id, uuid4())
+            update.assert_called_once_with(session.id, ItemStatus.PAUSED, 0)
+            notify.assert_awaited_once_with(session.room_id, "paused", "queued-first")
+            build_playback.assert_not_called()
+            adopt.assert_not_called()
+            advance.assert_not_awaited()
+            assert session.current_song_id == "queued-first"
+
+    anyio.run(run)
+
+
+@pytest.mark.parametrize("elapsed_seconds,ended", [(1, False), (181, True)])
+def test_paused_zero_progress_requires_elapsed_duration_before_queue_advance(
+    elapsed_seconds, ended
+):
+    """Distinguish blocked initial playback from a completed track resetting to zero."""
+    session = Session(
+        room_id=uuid4(),
+        playback_status=ItemStatus.PLAYING,
+        current_song_id="queued-first",
+        playback_position_ms=0,
+        playback_started_at=(
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=elapsed_seconds)
+        ),
+    )
+    adapter = AsyncMock()
+    adapter.get_current_playback.return_value = SpotifyPlaybackState(
+        is_playing=False,
+        track_id="queued-first",
+        progress_ms=0,
+        duration_ms=180000,
+        device_id="browser",
+    )
+    poller = PlaybackPollerService()
+    host_id = uuid4()
+
+    async def run():
+        with (
+            patch("backend.services.playback_poller_service.settings") as config,
+            patch(
+                "backend.services.playback_poller_service.SpotifyPlaybackAdapter",
+                return_value=adapter,
+            ),
+            patch.object(poller, "_get_session_state", side_effect=[session, None]),
+            patch.object(
+                poller, "_get_valid_token", new=AsyncMock(return_value="token")
+            ),
+            patch.object(poller, "_update_session_status") as update,
+            patch.object(poller, "_broadcast_state_changed", new=AsyncMock()),
+            patch.object(poller, "_adopt_external_track") as adopt,
+            patch.object(poller, "_advance_queue", new=AsyncMock()) as advance,
+        ):
+            config.PLAYBACK_POLL_INTERVAL_SECONDS = 0
+            await poller._poll_loop(session.room_id, host_id)
+            if ended:
+                advance.assert_awaited_once_with(
+                    session, session.room_id, host_id, adapter
+                )
+                update.assert_not_called()
+            else:
+                advance.assert_not_awaited()
+                update.assert_called_once_with(session.id, ItemStatus.PAUSED, 0)
+            adopt.assert_not_called()
+            assert session.current_song_id == "queued-first"
 
     anyio.run(run)

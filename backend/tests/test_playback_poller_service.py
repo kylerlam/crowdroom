@@ -313,7 +313,9 @@ class TestPollLoopExternalPause:
             ):
                 await poller._poll_loop(room_id, host_user_id)
 
-            mock_update_status.assert_called_once_with(session_id, ItemStatus.PAUSED)
+            mock_update_status.assert_called_once_with(
+                session_id, ItemStatus.PAUSED, 5000
+            )
             mock_broadcast.assert_called_once_with(room_id, "paused", "track_123")
 
         anyio.run(_run)
@@ -376,7 +378,9 @@ class TestPollLoopExternalPause:
             ):
                 await poller._poll_loop(room_id, host_user_id)
 
-            mock_update_status.assert_called_once_with(session_id, ItemStatus.PLAYING)
+            mock_update_status.assert_called_once_with(
+                session_id, ItemStatus.PLAYING, 5000
+            )
             mock_broadcast.assert_called_once_with(room_id, "playing", "track_123")
 
         anyio.run(_run)
