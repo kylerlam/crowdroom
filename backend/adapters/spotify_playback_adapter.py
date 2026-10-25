@@ -91,16 +91,21 @@ class SpotifyPlaybackAdapter:
             response.raise_for_status()
 
     async def prepare_device(
-        self, device_id: str | None = None, *, force_transfer: bool = False
+        self,
+        device_id: str | None = None,
+        *,
+        force_transfer: bool = False,
+        transfer_if_inactive: bool = True,
     ) -> str:
-        """Activate the chosen device before sending a separate playback command.
+        """Select an available device before sending an explicit playback command.
 
         Args:
             device_id: Selected target. Never silently substitutes another device.
             force_transfer: Re-activate once after an explicit missing-device error.
+            transfer_if_inactive: Transfer during explicit selection, not initial Play.
 
         Returns:
-            The available, active Spotify Connect device ID.
+            The available device ID. Actual playback is confirmed after Play.
         """
         devices = [
             device
@@ -119,25 +124,13 @@ class SpotifyPlaybackAdapter:
                 "Open Spotify on that device and refresh the device list.",
             )
         device_id = device["id"]
-        if device["is_active"] and not force_transfer:
+        if not force_transfer and (device["is_active"] or not transfer_if_inactive):
             return device_id
         await self.transfer(device_id)
-        for attempt in range(5):
-            devices = await self.get_devices()
-            if any(
-                item["id"] == device_id
-                and item["is_active"]
-                and not item["is_restricted"]
-                for item in devices
-            ):
-                return device_id
-            if attempt < 4:
-                await asyncio.sleep(0.4)
-        raise SpotifyUpstreamException(
-            status_code=502,
-            detail="Spotify has not activated the selected device yet. "
-            "Keep Spotify open on that device and try again.",
-        )
+        # With no playback context, transfer(play=False) may leave an available
+        # phone inactive. The explicit URI Play creates its context; only that
+        # command's resulting playback state can prove it started successfully.
+        return device_id
 
     async def _confirm_playback(self, device_id: str, track_uri: str | None) -> None:
         """Require real playback on the requested device after Spotify accepts Play."""
@@ -164,8 +157,9 @@ class SpotifyPlaybackAdapter:
                 await asyncio.sleep(0.4)
         raise SpotifyUpstreamException(
             status_code=502,
-            detail="Spotify accepted Play but has not started the requested song "
-            "on the selected device. Keep Spotify open there and try again.",
+            detail="Spotify has not started the requested song on the selected device. "
+            "Open Spotify there and play a song once, "
+            "then return here and press Resume.",
         )
 
     async def _start_playback(
@@ -175,7 +169,7 @@ class SpotifyPlaybackAdapter:
         position_ms: int | None = None,
     ) -> str | None:
         """Prepare the target, issue Play once, and verify the real track and device."""
-        device_id = await self.prepare_device(device_id)
+        device_id = await self.prepare_device(device_id, transfer_if_inactive=False)
         async with httpx.AsyncClient() as client:
             for attempt in range(2):
                 body = {"uris": [track_uri]} if track_uri else {}
