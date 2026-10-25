@@ -188,11 +188,19 @@ class TestPlaybackControlServicePlay:
 
     @patch("backend.services.playback_control_service.SpotifyPlaybackAdapter")
     def test_play_spotify_404_raises_upstream_exception(
-        self, mock_adapter_cls, service, mock_room_service, mock_song_repo
+        self,
+        mock_adapter_cls,
+        service,
+        mock_room_service,
+        mock_song_repo,
+        mock_session_repo,
     ):
         mock_song = MagicMock(spec=Song)
         mock_song.external_id = "track_id"
         mock_song_repo.get_by_id.return_value = mock_song
+        mock_session_repo.get_by_room.return_value = SessionModel(
+            room_id=uuid4(), playback_position_ms=0
+        )
 
         mock_response = MagicMock()
         mock_response.status_code = 404
@@ -530,6 +538,7 @@ class TestPlaybackControlServiceSkip:
 
         mock_session = MagicMock(spec=SessionModel)
         mock_session.id = session_id
+        mock_session.playback_position_ms = 0
         mock_session_repo.get_by_room.return_value = mock_session
 
         mock_next_song = MagicMock(spec=Song)

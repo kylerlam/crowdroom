@@ -1,8 +1,11 @@
 """Spotify playback control adapter for user-scoped API calls."""
 
+import asyncio
 from dataclasses import dataclass
 
 import httpx
+
+from backend.core.exceptions import SpotifyUpstreamException
 
 
 @dataclass
@@ -30,17 +33,23 @@ class SpotifyPlaybackAdapter:
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"}
 
-    async def play(self, track_uri: str, device_id: str | None = None) -> str | None:
+    async def play(
+        self,
+        track_uri: str,
+        device_id: str | None = None,
+        position_ms: int | None = None,
+    ) -> str | None:
         """Start or resume playback of a track on Spotify.
 
         Args:
             track_uri: Spotify track URI (e.g., "spotify:track:abc123").
             device_id: Target device ID. Uses active device if None.
+            position_ms: Saved playback position when restoring a track on a device.
 
         Raises:
             httpx.HTTPStatusError: If Spotify rejects the request.
         """
-        return await self._start_playback(device_id, track_uri)
+        return await self._start_playback(device_id, track_uri, position_ms)
 
     async def resume(self, device_id: str | None = None) -> str | None:
         """Resume playback without changing the current track.
@@ -81,13 +90,98 @@ class SpotifyPlaybackAdapter:
             )
             response.raise_for_status()
 
+    async def prepare_device(
+        self, device_id: str | None = None, *, force_transfer: bool = False
+    ) -> str:
+        """Activate the chosen device before sending a separate playback command.
+
+        Args:
+            device_id: Selected target. Never silently substitutes another device.
+            force_transfer: Re-activate once after an explicit missing-device error.
+
+        Returns:
+            The available, active Spotify Connect device ID.
+        """
+        devices = [
+            device
+            for device in await self.get_devices()
+            if device["id"] and not device["is_restricted"]
+        ]
+        if device_id:
+            device = next((item for item in devices if item["id"] == device_id), None)
+        else:
+            device = next((item for item in devices if item["is_active"]), None)
+            device = device or next(iter(devices), None)
+        if not device:
+            raise SpotifyUpstreamException(
+                status_code=404,
+                detail="The selected Spotify device is unavailable. "
+                "Open Spotify on that device and refresh the device list.",
+            )
+        device_id = device["id"]
+        if device["is_active"] and not force_transfer:
+            return device_id
+        await self.transfer(device_id)
+        for attempt in range(5):
+            devices = await self.get_devices()
+            if any(
+                item["id"] == device_id
+                and item["is_active"]
+                and not item["is_restricted"]
+                for item in devices
+            ):
+                return device_id
+            if attempt < 4:
+                await asyncio.sleep(0.4)
+        raise SpotifyUpstreamException(
+            status_code=502,
+            detail="Spotify has not activated the selected device yet. "
+            "Keep Spotify open on that device and try again.",
+        )
+
+    async def _confirm_playback(self, device_id: str, track_uri: str | None) -> None:
+        """Require real playback on the requested device after Spotify accepts Play."""
+        track_id = track_uri.rsplit(":", 1)[-1] if track_uri else None
+        for attempt in range(5):
+            try:
+                state = await self.get_current_playback()
+            except httpx.HTTPStatusError as error:
+                # Play was already accepted. Do not let a failed confirmation read
+                # trigger another Play that could reset the song's position.
+                raise SpotifyUpstreamException(
+                    status_code=error.response.status_code,
+                    detail="Spotify accepted Play but playback could not be verified. "
+                    "Refresh playback status before trying again.",
+                ) from error
+            if (
+                state
+                and state.is_playing
+                and state.device_id == device_id
+                and (track_id is None or state.track_id == track_id)
+            ):
+                return
+            if attempt < 4:
+                await asyncio.sleep(0.4)
+        raise SpotifyUpstreamException(
+            status_code=502,
+            detail="Spotify accepted Play but has not started the requested song "
+            "on the selected device. Keep Spotify open there and try again.",
+        )
+
     async def _start_playback(
-        self, device_id: str | None, track_uri: str | None = None
+        self,
+        device_id: str | None,
+        track_uri: str | None = None,
+        position_ms: int | None = None,
     ) -> str | None:
-        """Retry one missing-device response using a fresh Connect device list."""
+        """Prepare the target, issue Play once, and verify the real track and device."""
+        device_id = await self.prepare_device(device_id)
         async with httpx.AsyncClient() as client:
             for attempt in range(2):
-                kwargs = {"json": {"uris": [track_uri]}} if track_uri else {}
+                body = {"uris": [track_uri]} if track_uri else {}
+                if position_ms is not None:
+                    body["position_ms"] = max(0, position_ms)
+                kwargs = {"json": body} if body else {}
                 response = await client.put(
                     url=self.BASE_URL + "/play",
                     headers=self._headers(),
@@ -96,23 +190,9 @@ class SpotifyPlaybackAdapter:
                 )
                 if response.status_code != 404 or attempt:
                     response.raise_for_status()
+                    await self._confirm_playback(device_id, track_uri)
                     return device_id
-                devices = [
-                    device
-                    for device in await self.get_devices()
-                    if device["id"] and not device["is_restricted"]
-                ]
-                preferred = next(
-                    (device for device in devices if device["id"] == device_id), None
-                )
-                active = next(
-                    (device for device in devices if device["is_active"]), None
-                )
-                device = preferred or active or next(iter(devices), None)
-                if not device:
-                    response.raise_for_status()
-                device_id = device["id"]
-                await self.transfer(device_id)
+                device_id = await self.prepare_device(device_id, force_transfer=True)
 
     async def pause(self, device_id: str | None = None) -> None:
         """Pause the user's current playback.

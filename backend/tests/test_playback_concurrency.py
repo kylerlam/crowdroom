@@ -191,7 +191,7 @@ def test_autostart_network_failure_leaves_inserted_songs_queued(
     anyio.run(state.controls[0].start_if_idle, state.session.id)
     queue = state.controls[0]._queue_service
     assert queue.get_queue_count(state.session.id) == 2
-    assert state.cached_sessions[0].playback_status == ItemStatus.STOPPED
+    assert state.cached_sessions[0].playback_status == ItemStatus.PAUSED
 
 
 def test_poller_rechecks_pause_after_waiting_for_manual_control(playback_requests):

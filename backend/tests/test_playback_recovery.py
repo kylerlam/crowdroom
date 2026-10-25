@@ -1,5 +1,6 @@
 """Regression checks for exhausted queues and deliberate playback pauses."""
 
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -10,7 +11,10 @@ from sqlmodel import Session as DBSession
 from sqlmodel import SQLModel, create_engine
 
 from backend.adapters.spotify_playback_adapter import SpotifyPlaybackState
-from backend.core.exceptions import SpotifyConnectionRequiredException
+from backend.core.exceptions import (
+    SpotifyConnectionRequiredException,
+    SpotifyUpstreamException,
+)
 from backend.db.models import QueueItem, Room, Song, User
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
 from backend.db.models.session import Session as SessionModel
@@ -175,6 +179,142 @@ def test_automatic_playback_keeps_and_updates_the_selected_device(recovery_stack
     anyio.run(run)
     adapter.play.assert_awaited_once_with("spotify:track:first", "saved-browser")
     assert session.current_device_id == "recovered-browser"
+
+
+def test_resume_on_a_new_phone_sends_current_queue_uri_and_saved_position(
+    recovery_stack,
+):
+    """A phone without Spotify context cannot resume the room via an empty body."""
+    session, first, _, repo, _, _, control, adapter = recovery_stack
+    repo.create(QueueItem(session_id=session.id, song_id=first.id, group="manual"))
+    control._session_repo.update(
+        session.id,
+        {
+            "current_song_id": first.external_id,
+            "current_device_id": "iphone",
+            "playback_status": ItemStatus.PAUSED,
+            "playback_position_ms": 43000,
+        },
+    )
+    adapter.get_current_playback.return_value = None
+    adapter.play.return_value = "iphone"
+    anyio.run(control.play, session.room_id, uuid4())
+    adapter.play.assert_awaited_once_with(
+        "spotify:track:first", "iphone", position_ms=43000
+    )
+    adapter.resume.assert_not_awaited()
+    assert session.current_song_id == first.external_id
+    assert session.playback_position_ms == 43000
+
+
+def test_confirmed_phone_playback_is_not_reset_by_resume(recovery_stack):
+    """A repeated Resume observes the actual device and preserves its progress."""
+    session, first, _, repo, _, _, control, adapter = recovery_stack
+    repo.create(QueueItem(session_id=session.id, song_id=first.id, group="manual"))
+    control._session_repo.update(
+        session.id,
+        {
+            "current_song_id": first.external_id,
+            "current_device_id": "iphone",
+            "playback_status": ItemStatus.PAUSED,
+            "playback_position_ms": 43000,
+        },
+    )
+    adapter.get_current_playback.return_value = SpotifyPlaybackState(
+        is_playing=True,
+        track_id="first",
+        progress_ms=47000,
+        duration_ms=180000,
+        device_id="iphone",
+    )
+    anyio.run(control.play, session.room_id, uuid4())
+    adapter.play.assert_not_awaited()
+    adapter.resume.assert_not_awaited()
+    assert session.playback_position_ms == 47000
+    assert session.playback_status == ItemStatus.PLAYING
+
+
+def test_unconfirmed_phone_playback_keeps_current_queue_and_paused_position(
+    recovery_stack,
+):
+    """A Play 204 without actual output cannot mark or consume the queued song."""
+    session, first, _, repo, queue, _, control, adapter = recovery_stack
+    item = repo.create(
+        QueueItem(session_id=session.id, song_id=first.id, group="manual")
+    )
+    control._session_repo.update(
+        session.id,
+        {
+            "current_song_id": first.external_id,
+            "current_device_id": "iphone",
+            "playback_status": ItemStatus.PAUSED,
+            "playback_position_ms": 43000,
+        },
+    )
+    adapter.get_current_playback.return_value = None
+    adapter.play.side_effect = SpotifyUpstreamException(502, "Playback not confirmed")
+    with pytest.raises(SpotifyUpstreamException):
+        anyio.run(control.play, session.room_id, uuid4())
+    assert [queued.id for queued in queue.get_queue(session.id)] == [item.id]
+    assert session.playback_status == ItemStatus.PAUSED
+    assert session.playback_position_ms == 43000
+    assert session.current_song_id == first.external_id
+
+
+def test_explicit_queue_song_overrides_old_external_context_on_selected_phone(
+    recovery_stack,
+):
+    """The empty-player Resume may explicitly select its visible first queued song."""
+    session, first, _, repo, _, _, control, adapter = recovery_stack
+    repo.create(QueueItem(session_id=session.id, song_id=first.id, group="manual"))
+    control._session_repo.update(
+        session.id,
+        {
+            "current_song_id": "old-external-track",
+            "current_device_id": "iphone",
+            "playback_status": ItemStatus.PAUSED,
+            "playback_position_ms": 43000,
+        },
+    )
+    adapter.play.return_value = "iphone"
+    anyio.run(control.play, session.room_id, uuid4(), first.id)
+    adapter.play.assert_awaited_once_with("spotify:track:first", "iphone")
+    adapter.resume.assert_not_awaited()
+    assert session.current_song_id == first.external_id
+    assert session.playback_position_ms == 0
+
+
+def test_lost_phone_context_restores_elapsed_position_and_holds_after_failure(
+    recovery_stack,
+):
+    """A previously playing room must not restore a disconnected phone at zero."""
+    session, first, _, repo, queue, _, control, adapter = recovery_stack
+    item = repo.create(
+        QueueItem(session_id=session.id, song_id=first.id, group="manual")
+    )
+    now = datetime(2026, 10, 26, 12, 0)
+    control._session_repo.update(
+        session.id,
+        {
+            "current_song_id": first.external_id,
+            "current_device_id": "iphone",
+            "playback_status": ItemStatus.PLAYING,
+            "playback_position_ms": 30000,
+            "playback_started_at": now - timedelta(seconds=90),
+        },
+    )
+    adapter.get_current_playback.return_value = None
+    adapter.play.side_effect = SpotifyUpstreamException(502, "Playback not confirmed")
+    with patch("backend.services.playback_control_service._utcnow", return_value=now):
+        with pytest.raises(SpotifyUpstreamException):
+            anyio.run(control.play, session.room_id, uuid4())
+    adapter.play.assert_awaited_once_with(
+        "spotify:track:first", "iphone", position_ms=120000
+    )
+    assert [queued.id for queued in queue.get_queue(session.id)] == [item.id]
+    assert session.playback_status == ItemStatus.PAUSED
+    assert session.playback_position_ms == 120000
+    assert session.playback_started_at is None
 
 
 @pytest.mark.parametrize("status", [ItemStatus.PAUSED, ItemStatus.STOPPED])

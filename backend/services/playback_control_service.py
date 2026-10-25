@@ -114,16 +114,18 @@ class PlaybackControlService:
         adapter: SpotifyPlaybackAdapter,
         host_user_id: UUID,
         device_id: str | None,
-        track_uri: str | None = None,
+        track_uri: str,
+        position_ms: int | None = None,
     ) -> str | None:
         """Renew a rejected token once, keeping the same device and command."""
         for attempt in range(2):
             try:
-                resolved = (
-                    await adapter.play(track_uri, device_id)
-                    if track_uri
-                    else await adapter.resume(device_id)
-                )
+                if position_ms is None:
+                    resolved = await adapter.play(track_uri, device_id)
+                else:
+                    resolved = await adapter.play(
+                        track_uri, device_id, position_ms=position_ms
+                    )
                 return resolved if isinstance(resolved, str) else device_id
             except httpx.HTTPStatusError as error:
                 if error.response.status_code == 401 and not attempt:
@@ -133,6 +135,48 @@ class PlaybackControlService:
                     status_code=error.response.status_code,
                     detail=self._spotify_error_detail(error),
                 ) from error
+
+    @staticmethod
+    def _saved_position(session) -> int:
+        """Retain elapsed playback when the selected device loses its context."""
+        position = session.playback_position_ms or 0
+        if session.playback_status == ItemStatus.PLAYING and isinstance(
+            session.playback_started_at, datetime
+        ):
+            position += int(
+                (
+                    _utcnow() - session.playback_started_at.replace(tzinfo=None)
+                ).total_seconds()
+                * 1000
+            )
+        return max(0, position)
+
+    async def _hold_after_failed_start(
+        self, room_id: UUID, session, position_ms: int | None = None
+    ) -> None:
+        """Keep an unconfirmed Play resumable instead of retrying in background."""
+        if session is None:
+            return
+        current_item = self._queue_service.get_current_song(session.id)
+        if (
+            current_item
+            and current_item.song
+            and current_item.song.external_id == session.current_song_id
+        ):
+            current_item.playback_status = ItemStatus.PAUSED
+        self._session_repo.update(
+            session.id,
+            {
+                "playback_status": ItemStatus.PAUSED,
+                "playback_started_at": None,
+                "playback_position_ms": (
+                    self._saved_position(session)
+                    if position_ms is None
+                    else position_ms
+                ),
+            },
+        )
+        await self._broadcast_state_changed(room_id, "paused", session.current_song_id)
 
     async def start_if_idle(self, session_id: UUID) -> None:
         """Auto-start the queue after an addition, unless playback was paused.
@@ -207,48 +251,37 @@ class PlaybackControlService:
     ) -> None:
         """Play while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
+        if device_id is not None:
+            self._room_service.assert_host(room_id, user_id)
         host_user_id = room.host_user_id
 
         session = self._session_repo.get_by_room(room_id, fresh=True)
         if device_id is None and session:
             saved_device = session.current_device_id
             device_id = saved_device if isinstance(saved_device, str) else None
-        if song_id is None and (
-            session is None
-            or not session.current_song_id
-            or session.playback_status == ItemStatus.STOPPED
-        ):
-            next_item = (
+        if song_id is None:
+            current_item = (
                 self._queue_service.get_current_song(session.id) if session else None
             )
-            if next_item is None:
-                raise ValueError("Add a song first ლ(´•д• ̀ლ")
-            song_id = next_item.song_id
-
-        if song_id is None:
-            adapter = await self._get_adapter(host_user_id)
-            device_id = await self._start_on_device(adapter, host_user_id, device_id)
-            if session:
-                current_item = self._queue_service.get_current_song(session.id)
+            if (
+                session
+                and session.current_song_id
+                and (session.playback_status != ItemStatus.STOPPED)
+            ):
                 if (
                     current_item
                     and current_item.song.external_id == session.current_song_id
                 ):
-                    current_item.playback_status = ItemStatus.PLAYING
-                self._session_repo.update(
-                    session.id,
-                    {
-                        "playback_status": ItemStatus.PLAYING,
-                        "playback_started_at": _utcnow(),
-                        "current_device_id": device_id,
-                    },
-                )
-            await self._broadcast_state_changed(
-                room_id, "playing", session.current_song_id if session else None
-            )
-            if self._playback_poller and session:
-                await self._playback_poller.start_polling(room_id, host_user_id)
-            return
+                    song_id = current_item.song_id
+                else:
+                    saved_song = self._song_repo.get_by_external_id(
+                        session.current_song_id, StreamingPlatforms.SPOTIFY.value
+                    )
+                    song_id = saved_song.id if saved_song else None
+            if song_id is None:
+                if current_item is None:
+                    raise ValueError("Add a song first ლ(´•д• ̀ლ")
+                song_id = current_item.song_id
 
         song = self._song_repo.get_by_id(song_id)
         if not song:
@@ -257,31 +290,39 @@ class PlaybackControlService:
         adapter = await self._get_adapter(host_user_id)
         session = self._session_repo.get_by_room(room_id, fresh=True)
 
-        already_playing = (
-            session
-            and session.current_song_id == song.external_id
-            and session.playback_status == ItemStatus.PLAYING
-        )
-        if already_playing:
-            if self._playback_poller and not self._playback_poller.is_polling(room_id):
-                await self._playback_poller.start_polling(room_id, host_user_id)
-            return
-
         is_resume = (
             session
             and session.current_song_id == song.external_id
-            and session.playback_status == ItemStatus.PAUSED
+            and session.playback_status in {ItemStatus.PAUSED, ItemStatus.PLAYING}
         )
-
-        device_id = await self._start_on_device(
-            adapter,
-            host_user_id,
-            device_id,
-            None if is_resume else f"spotify:track:{song.external_id}",
-        )
+        resume_position = self._saved_position(session) if is_resume else 0
+        confirmed_playing = False
+        if is_resume:
+            state = await self.get_current_playback(room_id, user_id)
+            if state and state.track_id == song.external_id:
+                if state.progress_ms is not None:
+                    resume_position = state.progress_ms
+                confirmed_playing = state.is_playing and (
+                    not device_id or state.device_id == device_id
+                )
+                if confirmed_playing:
+                    device_id = state.device_id
+        if not confirmed_playing:
+            try:
+                device_id = await self._start_on_device(
+                    adapter,
+                    host_user_id,
+                    device_id,
+                    f"spotify:track:{song.external_id}",
+                    resume_position if is_resume else None,
+                )
+            except SpotifyUpstreamException, httpx.RequestError:
+                await self._hold_after_failed_start(
+                    room_id, session, resume_position if is_resume else None
+                )
+                raise
 
         now = _utcnow()
-        resume_position = session.playback_position_ms or 0 if is_resume else 0
 
         if session:
             current_item = self._queue_service.get_current_song(session.id)
@@ -400,12 +441,16 @@ class PlaybackControlService:
             track_uri = f"spotify:track:{next_item.song.external_id}"
             adapter = await self._get_adapter(host_user_id)
             saved_device = session.current_device_id
-            device_id = await self._start_on_device(
-                adapter,
-                host_user_id,
-                saved_device if isinstance(saved_device, str) else None,
-                track_uri,
-            )
+            try:
+                device_id = await self._start_on_device(
+                    adapter,
+                    host_user_id,
+                    saved_device if isinstance(saved_device, str) else None,
+                    track_uri,
+                )
+            except SpotifyUpstreamException, httpx.RequestError:
+                await self._hold_after_failed_start(room_id, session)
+                raise
             next_item.playback_status = ItemStatus.PLAYING
             self._session_repo.update(
                 session.id,
@@ -503,25 +548,19 @@ class PlaybackControlService:
     async def select_device(self, room_id: UUID, user_id: UUID, device_id: str) -> None:
         """Transfer to an available device without overriding a deliberate pause."""
         async with _room_playback_lock(room_id):
-            room = self._room_service.assert_manager(room_id, user_id)
+            room = self._room_service.assert_host(room_id, user_id)
             session = self._session_repo.get_by_room(room_id, fresh=True)
             if session is None:
                 raise ValueError("The room has no active session")
             adapter = await self._get_adapter(room.host_user_id)
             for attempt in range(2):
                 try:
-                    devices = await adapter.get_devices()
-                    device = next(
-                        (item for item in devices if item["id"] == device_id), None
-                    )
-                    if not device or device["is_restricted"]:
-                        raise ValueError(
-                            "This Spotify device is unavailable. "
-                            "Refresh devices and try again."
-                        )
-                    if not device["is_active"]:
-                        await adapter.transfer(device_id)
+                    await adapter.prepare_device(device_id)
                     break
+                except SpotifyUpstreamException as error:
+                    if error.upstream_status_code == 404:
+                        raise ValueError(str(error)) from error
+                    raise
                 except httpx.HTTPStatusError as error:
                     if error.response.status_code == 401 and not attempt:
                         adapter = await self._get_fresh_adapter(room.host_user_id)

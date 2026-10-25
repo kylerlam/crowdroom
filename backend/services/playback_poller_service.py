@@ -17,6 +17,7 @@ from backend.core.config import settings
 from backend.core.exceptions import (
     EntityNotFoundException,
     SpotifyConnectionRequiredException,
+    SpotifyUpstreamException,
 )
 from backend.db.database import engine
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
@@ -348,6 +349,15 @@ class PlaybackPollerService:
         if next_uri:
             try:
                 resolved_device = await adapter.play(next_uri, device_id)
+            except SpotifyUpstreamException, httpx.RequestError:
+                logger.warning(
+                    "Spotify did not confirm next-track playback for room %s", room_id
+                )
+                await asyncio.to_thread(
+                    self._update_session_status, session.id, ItemStatus.PAUSED
+                )
+                await self._broadcast_state_changed(room_id, "paused")
+                return
             except httpx.HTTPStatusError as error:
                 if error.response.status_code == 401:
                     try:
@@ -356,12 +366,20 @@ class PlaybackPollerService:
                         )
                         adapter = SpotifyPlaybackAdapter(token)
                         resolved_device = await adapter.play(next_uri, device_id)
-                    except httpx.HTTPStatusError:
+                    except (
+                        httpx.HTTPStatusError,
+                        SpotifyUpstreamException,
+                        httpx.RequestError,
+                    ):
                         logger.warning(
                             "Failed to auto-play next track for room %s "
                             "after token refresh",
                             room_id,
                         )
+                        await asyncio.to_thread(
+                            self._update_session_status, session.id, ItemStatus.PAUSED
+                        )
+                        await self._broadcast_state_changed(room_id, "paused")
                         return
                 else:
                     logger.warning(
@@ -369,6 +387,10 @@ class PlaybackPollerService:
                         room_id,
                         error.response.status_code,
                     )
+                    await asyncio.to_thread(
+                        self._update_session_status, session.id, ItemStatus.PAUSED
+                    )
+                    await self._broadcast_state_changed(room_id, "paused")
                     return
             track_id = next_uri.split(":")[-1]
             if isinstance(resolved_device, str):
@@ -580,9 +602,22 @@ class PlaybackPollerService:
                         backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
                         continue
 
+                    selected_device = session.current_device_id
                     if (
+                        isinstance(selected_device, str)
+                        and selected_device
+                        and state.device_id != selected_device
+                    ):
+                        if session.playback_status == ItemStatus.PLAYING:
+                            await self._pause_if_unchanged(
+                                session, room_id, self._estimated_position_ms(session)
+                            )
+                        backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                        continue
+
+                    if state.track_id != session.current_song_id and (
                         not state.is_playing
-                        and state.track_id != session.current_song_id
+                        or session.playback_status == ItemStatus.PAUSED
                     ):
                         # Spotify can acknowledge Play before its web player has
                         # activated, while still returning the previous paused track.

@@ -15,7 +15,10 @@ from backend.adapters.spotify_playback_adapter import (
 class TestSpotifyPlaybackAdapterPlay:
     @pytest.fixture
     def adapter(self):
-        return SpotifyPlaybackAdapter("test_token")
+        adapter = SpotifyPlaybackAdapter("test_token")
+        adapter.prepare_device = AsyncMock(side_effect=lambda device_id: device_id)
+        adapter._confirm_playback = AsyncMock()
+        return adapter
 
     @patch("backend.adapters.spotify_playback_adapter.httpx.AsyncClient")
     def test_play_sends_put_with_uri(self, mock_client_cls, adapter):
