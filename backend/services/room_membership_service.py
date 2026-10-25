@@ -137,7 +137,7 @@ class RoomMembershipService:
         if user.room_id == room_id:
             if self._admission_repo.get(room_id, user.id) is None:
                 self._admission_repo.set_status(room_id, user.id, "approved")
-            return self._join_result(room, "joined")
+            return self._join_result(room, "joined", user)
 
         max_members = room.settings.get("max_members", 50)
         current_count = self._user_repo.count_by_room(room_id)
@@ -170,9 +170,9 @@ class RoomMembershipService:
         elif admission is None:
             self._admission_repo.set_status(room_id, user.id, "pending")
             await self._notify_admission(room, user.id, "pending")
-            return self._join_result(room, "pending")
+            return self._join_result(room, "pending", user)
         elif admission.status != "approved":
-            return self._join_result(room, admission.status)
+            return self._join_result(room, admission.status, user)
 
         user.room_id = room_id
         self._user_repo.save(user)
@@ -189,10 +189,10 @@ class RoomMembershipService:
             },
             str(room_id),
         )
-        return self._join_result(room, "joined")
+        return self._join_result(room, "joined", user)
 
     @staticmethod
-    def _join_result(room: Room, status: str) -> RoomJoinResult:
+    def _join_result(room: Room, status: str, user: User) -> RoomJoinResult:
         """Describe whether the account joined or needs a manager's decision."""
         messages = {
             "joined": "Joined room successfully",
@@ -210,6 +210,7 @@ class RoomMembershipService:
             room_name=room.room_name,
             status=status,
             message=messages[status],
+            public_id=user.public_id,
         )
 
     def get_admission_status(self, room_id: UUID, user: User) -> RoomAdmissionStatus:
@@ -230,7 +231,10 @@ class RoomMembershipService:
         self._room_service.assert_manager(room_id, actor_id)
         return [
             RoomAdmissionRequest(
-                user_id=entry.user_id, username=entry.user.username, status=entry.status
+                user_id=entry.user_id,
+                username=entry.user.username,
+                public_id=entry.user.public_id,
+                status=entry.status,
             )
             for entry in self._admission_repo.list_for_review(room_id)
         ]

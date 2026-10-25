@@ -221,6 +221,7 @@ class TestRoomInviteService:
                 room_name=room.room_name,
                 status="pending",
                 message="Approval required",
+                public_id="CR-4827-9163",
             )
         )
         result = anyio.run(
@@ -230,6 +231,7 @@ class TestRoomInviteService:
         assert result.room_id == room.id
         assert result.room_name == room.room_name
         assert result.status == "pending"
+        assert result.public_id == "CR-4827-9163"
         assert user.room_id is None
         mock_invite_repo.increment_use_count.assert_not_called()
         membership.join_room.assert_awaited_once_with(

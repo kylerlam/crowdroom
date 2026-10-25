@@ -94,6 +94,7 @@ class TestJoinRoom:
         mock_user = MagicMock(spec=User)
         mock_user.id = uuid4()
         mock_user.username = "testuser"
+        mock_user.public_id = "CR-4827-9163"
         mock_user.room_id = None
         return mock_user
 
@@ -557,6 +558,7 @@ class TestPinCooldown:
         mock_user.id = uuid4()
         mock_user.username = "testuser"
         mock_user.room_id = None
+        mock_user.public_id = "CR-4827-9163"
         return mock_user
 
     @pytest.fixture

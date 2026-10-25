@@ -19,6 +19,7 @@ from backend.core.rate_limit import RequestRateLimiter
 from backend.core.security import SecurityService
 from backend.db.database import get_session
 from backend.db.models import Room, RoomAdmission, RoomInvite, User
+from backend.db.models.enum import TokenType
 from backend.main import app
 from backend.repositories.room_admission_repo import RoomAdmissionRepository
 from backend.repositories.room_ban_repo import RoomBanRepository
@@ -71,6 +72,7 @@ def admission_room(tmp_path):
             engine=engine,
             room_id=room.id,
             ids={role: user.id for role, user in users.items()},
+            public_ids={role: user.public_id for role, user in users.items()},
             invite_id=invite.id,
             actor="applicant",
         )
@@ -226,6 +228,51 @@ def test_bad_credentials_never_create_an_admission_request(admission_room, crede
     state.notify.assert_not_awaited()
 
 
+@pytest.mark.parametrize("entrance", ["pin", "invite", "qr"])
+def test_applicant_and_manager_see_the_same_permanent_public_id(
+    admission_room, entrance
+):
+    state = admission_room
+    path, body = join_path(state, entrance)
+    if body is not None:
+        body = {**body, "public_id": state.public_ids["host"]}
+    pending = state.client.post(path, json=body)
+    assert pending.status_code == 200
+    assert pending.json()["public_id"] == state.public_ids["applicant"]
+    token = SecurityService(settings).create_token(
+        token_type=TokenType.ACCESS,
+        data={"sub": str(state.ids["applicant"]), "ver": 0},
+    )
+    profile = state.client.get(
+        "/api/v1/auth/me", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert profile.status_code == 200
+    assert profile.json()["public_id"] == state.public_ids["applicant"]
+    with DBSession(state.engine) as db:
+        applicant = db.get(User, state.ids["applicant"])
+        applicant.username = "renamed_applicant"
+        db.add(applicant)
+        db.commit()
+    list_path = f"/api/v1/rooms/{state.room_id}/admissions"
+    for actor in ("host", "admin"):
+        state.actor = actor
+        entries = state.client.get(list_path).json()
+        assert entries == [
+            {
+                "user_id": str(state.ids["applicant"]),
+                "username": "renamed_applicant",
+                "public_id": state.public_ids["applicant"],
+                "status": "pending",
+            }
+        ]
+    assert review(state).status_code == 200
+    state.actor = "applicant"
+    joined = state.client.post(path, json=body)
+    assert joined.status_code == 200
+    assert joined.json()["status"] == "joined"
+    assert joined.json()["public_id"] == state.public_ids["applicant"]
+
+
 def test_only_room_managers_can_list_and_review_requests(admission_room):
     state = admission_room
     path = f"/api/v1/rooms/{state.room_id}/join"
@@ -241,6 +288,7 @@ def test_only_room_managers_can_list_and_review_requests(admission_room):
             {
                 "user_id": str(state.ids["applicant"]),
                 "username": "applicant",
+                "public_id": state.public_ids["applicant"],
                 "status": "pending",
             }
         ]
@@ -252,6 +300,7 @@ def test_only_room_managers_can_list_and_review_requests(admission_room):
         {
             "user_id": str(state.ids["applicant"]),
             "username": "applicant",
+            "public_id": state.public_ids["applicant"],
             "status": "rejected",
         }
     ]

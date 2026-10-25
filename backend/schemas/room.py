@@ -164,6 +164,7 @@ class RoomJoinResult(BaseModel):
     room_name: str
     status: Literal["joined", "pending", "rejected"]
     message: str
+    public_id: str
 
 
 class RoomAdmissionStatus(BaseModel):
@@ -179,6 +180,7 @@ class RoomAdmissionRequest(BaseModel):
 
     user_id: UUID
     username: str
+    public_id: str
     status: Literal["pending", "rejected"]
 
 
