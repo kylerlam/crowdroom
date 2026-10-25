@@ -12,6 +12,7 @@ from backend.core.config import settings
 from backend.core.encryption import decrypt_data, encrypt_data
 from backend.core.exceptions import (
     EntityNotFoundException,
+    ForbiddenException,
     InvalidPlatformCredentialsException,
     SpotifyConnectionRequiredException,
     SpotifyUpstreamException,
@@ -45,6 +46,17 @@ class PlatformConnectionService:
     def __init__(self, repo: PlatformConnectionRepo):
         self._repo = repo
 
+    def can_manage_spotify_connection(self, user_id: UUID) -> bool:
+        """Return whether the account can manage its own Spotify authorization."""
+        return self._repo.can_manage_connection(user_id)
+
+    def assert_can_manage_spotify_connection(self, user_id: UUID) -> None:
+        """Prevent members and administrators from changing playback accounts."""
+        if not self.can_manage_spotify_connection(user_id):
+            raise ForbiddenException(
+                "Only the room host can manage Spotify connections"
+            )
+
     async def connect(
         self, user_id: UUID, data: CreatePlatformConnection
     ) -> PlatformConnection:
@@ -63,6 +75,8 @@ class PlatformConnectionService:
         Raises:
             InvalidPlatformCredentialsException: If platform rejects credentials.
         """
+        if data.platform == StreamingPlatforms.SPOTIFY:
+            self.assert_can_manage_spotify_connection(user_id)
         await SpotifyAuthAdapter.validate_credentials(data.credentials)
 
         existing = self._repo.get_by_user_and_platform(user_id, data.platform)
@@ -154,6 +168,8 @@ class PlatformConnectionService:
         Raises:
             EntityNotFoundException: If no connection exists for user+platform.
         """
+        if platform == StreamingPlatforms.SPOTIFY:
+            self.assert_can_manage_spotify_connection(user_id)
         connection = self._repo.get_by_user_and_platform(user_id, platform)
         if not connection:
             connection = PlatformConnection(
@@ -355,6 +371,8 @@ class PlatformConnectionService:
         Raises:
             EntityNotFoundException: If no connection exists for user+platform.
         """
+        if platform == StreamingPlatforms.SPOTIFY:
+            self.assert_can_manage_spotify_connection(user_id)
         connection = self._repo.get_by_user_and_platform(user_id, platform)
         if not connection:
             raise EntityNotFoundException(

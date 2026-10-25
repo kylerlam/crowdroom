@@ -7,6 +7,8 @@ from sqlmodel import Session as DBSession
 from sqlmodel import select
 
 from backend.db.models import PlatformConnection, StreamingPlatforms
+from backend.db.models.room import Room
+from backend.db.models.user import User
 
 
 class PlatformConnectionRepo:
@@ -35,6 +37,16 @@ class PlatformConnectionRepo:
         except IntegrityError:
             self._session.rollback()
             raise
+
+    def can_manage_connection(self, user_id: UUID) -> bool:
+        """Allow preauthorization or management by the current room's host."""
+        user = self._session.get(User, user_id, populate_existing=True)
+        if user is None:
+            return False
+        if user.room_id is None:
+            return True
+        room = self._session.get(Room, user.room_id, populate_existing=True)
+        return room is not None and room.host_user_id == user_id
 
     def get_by_id(self, connection_id: UUID) -> PlatformConnection | None:
         """Retrieve a connection by its primary key.

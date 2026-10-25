@@ -22,6 +22,15 @@ from backend.services.platform_connection_service import PlatformConnectionServi
 router = APIRouter(prefix="/platform-connections", tags=["platform_connections"])
 
 
+@router.get("/spotify/access")
+def get_spotify_connection_access(
+    service: PlatformConnectionService = Depends(get_platform_connection_service),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    """Return connection-management access without exposing credentials."""
+    return {"can_manage": service.can_manage_spotify_connection(current_user.id)}
+
+
 @router.post(
     "/", response_model=ReadPlatformConnection, status_code=status.HTTP_201_CREATED
 )

@@ -48,6 +48,7 @@ class SpotifyOAuthService:
         Returns:
             Full Spotify authorization URL to redirect the user to.
         """
+        self._platform_connection_service.assert_can_manage_spotify_connection(user_id)
         client_id = self._resolve_client_id(user_id)
 
         code_verifier = secrets.token_urlsafe(96)
@@ -94,6 +95,7 @@ class SpotifyOAuthService:
 
         user_id = UUID(state_payload["user_id"])
         code_verifier = state_payload["code_verifier"]
+        self._platform_connection_service.assert_can_manage_spotify_connection(user_id)
 
         client_id, client_secret = self._resolve_credentials(user_id)
         token_response = await self._request_tokens(
