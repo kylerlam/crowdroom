@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
@@ -13,7 +14,11 @@ from backend.adapters.spotify_playback_adapter import (
     SpotifyPlaybackState,
 )
 from backend.api.websocket import manager
-from backend.core.exceptions import EntityNotFoundException, SpotifyUpstreamException
+from backend.core.exceptions import (
+    EntityNotFoundException,
+    InvalidPlatformCredentialsException,
+    SpotifyUpstreamException,
+)
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
 from backend.repositories.session_repo import SessionRepository
 from backend.repositories.song_repo import SongRepository
@@ -21,6 +26,8 @@ from backend.services.platform_connection_service import PlatformConnectionServi
 from backend.services.playback_service import PlaybackService
 from backend.services.queue_service import QueueService
 from backend.services.room_service import RoomService
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from backend.services.playback_poller_service import PlaybackPollerService
@@ -91,6 +98,37 @@ class PlaybackControlService:
         )
         return SpotifyPlaybackAdapter(token)
 
+    async def start_if_idle(self, session_id: UUID) -> None:
+        """Auto-start the queue after an addition, unless playback was paused.
+
+        Playback failures leave the added song queued so a manager can retry.
+        """
+        session = self._session_repo.get_by_id(session_id)
+        if session is None:
+            return
+        if session.playback_status in {
+            ItemStatus.PAUSED,
+            ItemStatus.PLAYING,
+            ItemStatus.NOW_PLAYING,
+            ItemStatus.BUFFERING,
+        }:
+            return
+        if session.current_song_id and session.playback_status != ItemStatus.STOPPED:
+            return
+        next_item = self._queue_service.get_current_song(session_id)
+        if next_item is None:
+            return
+        room = self._room_service.get_room(session.room_id)
+        try:
+            await self.play(room.id, room.host_user_id, next_item.song_id)
+        except (
+            EntityNotFoundException,
+            InvalidPlatformCredentialsException,
+            SpotifyUpstreamException,
+            httpx.HTTPStatusError,
+        ):
+            logger.warning("Could not auto-start queued playback for room %s", room.id)
+
     async def play(
         self,
         room_id: UUID,
@@ -102,31 +140,50 @@ class PlaybackControlService:
 
         Args:
             room_id: The room the user is controlling.
-            user_id: The authenticated user (must be host).
+            user_id: The authenticated room host or administrator.
             song_id: Internal song UUID. Omit to resume current playback.
             device_id: Optional target device.
 
         Raises:
             EntityNotFoundException: If room or song not found.
-            ForbiddenException: If user is not room host.
+            ForbiddenException: If user cannot manage the room.
         """
-        self._room_service.assert_host(room_id, user_id)
+        room = self._room_service.assert_manager(room_id, user_id)
+        host_user_id = room.host_user_id
+
+        session = self._session_repo.get_by_room(room_id)
+        if song_id is None and (
+            session is None
+            or not session.current_song_id
+            or session.playback_status == ItemStatus.STOPPED
+        ):
+            next_item = (
+                self._queue_service.get_current_song(session.id) if session else None
+            )
+            if next_item is None:
+                raise ValueError("Add a song first ლ(´•д• ̀ლ")
+            song_id = next_item.song_id
 
         if song_id is None:
-            adapter = await self._get_adapter(user_id)
+            adapter = await self._get_adapter(host_user_id)
             try:
                 await adapter.resume(device_id)
             except httpx.HTTPStatusError as error:
                 if error.response.status_code == 401:
-                    adapter = await self._get_fresh_adapter(user_id)
+                    adapter = await self._get_fresh_adapter(host_user_id)
                     await adapter.resume(device_id)
                 else:
                     raise SpotifyUpstreamException(
                         status_code=error.response.status_code,
                         detail=self._spotify_error_detail(error),
                     ) from error
-            session = self._session_repo.get_by_room(room_id)
             if session:
+                current_item = self._queue_service.get_current_song(session.id)
+                if (
+                    current_item
+                    and current_item.song.external_id == session.current_song_id
+                ):
+                    current_item.playback_status = ItemStatus.PLAYING
                 self._session_repo.update(
                     session.id,
                     {
@@ -138,14 +195,14 @@ class PlaybackControlService:
                 room_id, "playing", session.current_song_id if session else None
             )
             if self._playback_poller and session:
-                await self._playback_poller.start_polling(room_id, user_id)
+                await self._playback_poller.start_polling(room_id, host_user_id)
             return
 
         song = self._song_repo.get_by_id(song_id)
         if not song:
             raise EntityNotFoundException("Song", song_id)
 
-        adapter = await self._get_adapter(user_id)
+        adapter = await self._get_adapter(host_user_id)
         session = self._session_repo.get_by_room(room_id)
 
         already_playing = (
@@ -155,7 +212,7 @@ class PlaybackControlService:
         )
         if already_playing:
             if self._playback_poller and not self._playback_poller.is_polling(room_id):
-                await self._playback_poller.start_polling(room_id, user_id)
+                await self._playback_poller.start_polling(room_id, host_user_id)
             return
 
         is_resume = (
@@ -172,7 +229,7 @@ class PlaybackControlService:
                 await adapter.play(track_uri, device_id)
         except httpx.HTTPStatusError as error:
             if error.response.status_code == 401:
-                adapter = await self._get_fresh_adapter(user_id)
+                adapter = await self._get_fresh_adapter(host_user_id)
                 if is_resume:
                     await adapter.resume(device_id)
                 else:
@@ -187,6 +244,9 @@ class PlaybackControlService:
         resume_position = session.playback_position_ms or 0 if is_resume else 0
 
         if session:
+            current_item = self._queue_service.get_current_song(session.id)
+            if current_item and current_item.song_id == song.id:
+                current_item.playback_status = ItemStatus.PLAYING
             self._session_repo.update(
                 session.id,
                 {
@@ -199,28 +259,31 @@ class PlaybackControlService:
             )
 
         await self._broadcast_state_changed(room_id, "playing", song.external_id)
+        if session and not is_resume:
+            await self._playback_service._broadcast_song_changed(session.id, song)
 
         if self._playback_poller:
-            await self._playback_poller.start_polling(room_id, user_id)
+            await self._playback_poller.start_polling(room_id, host_user_id)
 
     async def pause(self, room_id: UUID, user_id: UUID) -> None:
         """Pause playback on the host's Spotify.
 
         Args:
             room_id: The room the user is controlling.
-            user_id: The authenticated user (must be host).
+            user_id: The authenticated room host or administrator.
 
         Raises:
             EntityNotFoundException: If room not found.
-            ForbiddenException: If user is not room host.
+            ForbiddenException: If user cannot manage the room.
         """
-        self._room_service.assert_host(room_id, user_id)
-        adapter = await self._get_adapter(user_id)
+        room = self._room_service.assert_manager(room_id, user_id)
+        host_user_id = room.host_user_id
+        adapter = await self._get_adapter(host_user_id)
         try:
             await adapter.pause()
         except httpx.HTTPStatusError as error:
             if error.response.status_code == 401:
-                adapter = await self._get_fresh_adapter(user_id)
+                adapter = await self._get_fresh_adapter(host_user_id)
                 await adapter.pause()
             else:
                 raise SpotifyUpstreamException(
@@ -229,6 +292,13 @@ class PlaybackControlService:
                 ) from error
 
         session = self._session_repo.get_by_room(room_id)
+        if session:
+            current_item = self._queue_service.get_current_song(session.id)
+            if (
+                current_item
+                and current_item.song.external_id == session.current_song_id
+            ):
+                current_item.playback_status = ItemStatus.PAUSED
         if session and session.playback_started_at:
             now = _utcnow()
             started = session.playback_started_at.replace(tzinfo=None)
@@ -253,13 +323,14 @@ class PlaybackControlService:
 
         Args:
             room_id: The room the user is controlling.
-            user_id: The authenticated user (must be host).
+            user_id: The authenticated room host or administrator.
 
         Raises:
             EntityNotFoundException: If room not found.
-            ForbiddenException: If user is not room host.
+            ForbiddenException: If user cannot manage the room.
         """
-        self._room_service.assert_host(room_id, user_id)
+        room = self._room_service.assert_manager(room_id, user_id)
+        host_user_id = room.host_user_id
 
         session = self._session_repo.get_by_room(room_id)
         if session:
@@ -268,18 +339,19 @@ class PlaybackControlService:
         next_item = self._queue_service.get_current_song(session.id)
         if next_item and next_item.song:
             track_uri = f"spotify:track:{next_item.song.external_id}"
-            adapter = await self._get_adapter(user_id)
+            adapter = await self._get_adapter(host_user_id)
             try:
                 await adapter.play(track_uri)
             except httpx.HTTPStatusError as error:
                 if error.response.status_code == 401:
-                    adapter = await self._get_fresh_adapter(user_id)
+                    adapter = await self._get_fresh_adapter(host_user_id)
                     await adapter.play(track_uri)
                 else:
                     raise SpotifyUpstreamException(
                         status_code=error.response.status_code,
                         detail=self._spotify_error_detail(error),
                     ) from error
+            next_item.playback_status = ItemStatus.PLAYING
             self._session_repo.update(
                 session.id,
                 {
@@ -293,9 +365,9 @@ class PlaybackControlService:
                 room_id, "playing", next_item.song.external_id
             )
             if self._playback_poller:
-                await self._playback_poller.start_polling(room_id, user_id)
+                await self._playback_poller.start_polling(room_id, host_user_id)
         else:
-            adapter = await self._get_adapter(user_id)
+            adapter = await self._get_adapter(host_user_id)
             try:
                 await adapter.pause()
             except httpx.HTTPStatusError:
@@ -313,22 +385,23 @@ class PlaybackControlService:
 
         Args:
             room_id: The room to query.
-            user_id: The authenticated user (must be host).
+            user_id: The authenticated room host or administrator.
 
         Returns:
             Current playback state or None if nothing is active.
 
         Raises:
             EntityNotFoundException: If room not found.
-            ForbiddenException: If user is not room host.
+            ForbiddenException: If user cannot manage the room.
         """
-        self._room_service.assert_host(room_id, user_id)
-        adapter = await self._get_adapter(user_id)
+        room = self._room_service.assert_manager(room_id, user_id)
+        host_user_id = room.host_user_id
+        adapter = await self._get_adapter(host_user_id)
         try:
             return await adapter.get_current_playback()
         except httpx.HTTPStatusError as error:
             if error.response.status_code == 401:
-                adapter = await self._get_fresh_adapter(user_id)
+                adapter = await self._get_fresh_adapter(host_user_id)
                 return await adapter.get_current_playback()
             raise SpotifyUpstreamException(
                 status_code=error.response.status_code,

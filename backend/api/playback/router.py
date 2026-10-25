@@ -36,6 +36,10 @@ async def play(
             song_id=body.song_id,
             device_id=body.device_id,
         )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+        ) from exc
     except ForbiddenException as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)

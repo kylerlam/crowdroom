@@ -105,7 +105,7 @@ class TestPlaybackControlServicePlay:
 
         anyio.run(_run)
 
-        mock_room_service.assert_host.assert_called_once_with(room_id, user_id)
+        mock_room_service.assert_manager.assert_called_once_with(room_id, user_id)
         mock_song_repo.get_by_id.assert_called_once_with(song_id)
         mock_adapter.play.assert_called_once_with(
             "spotify:track:spotify_track_id", "dev1"
@@ -121,7 +121,7 @@ class TestPlaybackControlServicePlay:
         assert update_data["playback_position_ms"] == 0
 
     def test_play_non_host_forbidden(self, service, mock_room_service):
-        mock_room_service.assert_host.side_effect = ForbiddenException(
+        mock_room_service.assert_manager.side_effect = ForbiddenException(
             "Only the room host can perform this action"
         )
 
@@ -132,7 +132,7 @@ class TestPlaybackControlServicePlay:
             anyio.run(_run)
 
     def test_play_song_not_found(self, service, mock_room_service, mock_song_repo):
-        mock_room_service.assert_host.return_value = MagicMock()
+        mock_room_service.assert_manager.return_value = MagicMock()
         mock_song_repo.get_by_id.return_value = None
 
         async def _run():
@@ -283,7 +283,7 @@ class TestPlaybackControlServicePause:
 
         anyio.run(_run)
 
-        mock_room_service.assert_host.assert_called_once_with(room_id, user_id)
+        mock_room_service.assert_manager.assert_called_once_with(room_id, user_id)
         mock_adapter.pause.assert_called_once()
         mock_session_repo.update.assert_called_once()
         call_args = mock_session_repo.update.call_args
@@ -293,7 +293,7 @@ class TestPlaybackControlServicePause:
         assert "playback_position_ms" in update_data
 
     def test_pause_non_host_forbidden(self, service, mock_room_service):
-        mock_room_service.assert_host.side_effect = ForbiddenException(
+        mock_room_service.assert_manager.side_effect = ForbiddenException(
             "Only the room host can perform this action"
         )
 
@@ -443,7 +443,7 @@ class TestPlaybackControlServiceSkip:
 
         anyio.run(_run)
 
-        mock_room_service.assert_host.assert_called_once_with(room_id, user_id)
+        mock_room_service.assert_manager.assert_called_once_with(room_id, user_id)
         mock_playback_service.finish_song.assert_called_once_with(session_id)
         mock_queue_service.get_current_song.assert_called_once_with(session_id)
         mock_adapter.play.assert_called_once_with("spotify:track:next_track_id")
@@ -456,7 +456,7 @@ class TestPlaybackControlServiceSkip:
         assert update_data["playback_position_ms"] == 0
 
     def test_skip_non_host_forbidden(self, service, mock_room_service):
-        mock_room_service.assert_host.side_effect = ForbiddenException(
+        mock_room_service.assert_manager.side_effect = ForbiddenException(
             "Only the room host can perform this action"
         )
 
@@ -627,7 +627,7 @@ class TestPlaybackControlServiceGetCurrentPlayback:
 
         result = anyio.run(_run)
 
-        mock_room_service.assert_host.assert_called_once_with(room_id, user_id)
+        mock_room_service.assert_manager.assert_called_once_with(room_id, user_id)
         assert result == expected_state
 
     @patch("backend.services.playback_control_service.SpotifyPlaybackAdapter")

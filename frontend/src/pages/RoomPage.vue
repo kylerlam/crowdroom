@@ -21,8 +21,14 @@
       <!-- Now Playing -->
       <section class="panel now-playing-panel">
         <div v-if="!currentSong" class="empty-state">
-          <i class="ph ph-music-notes"></i>
-          <p>Nothing playing</p>
+          <i class="ph ph-play"></i>
+          <button
+            class="btn btn-primary"
+            :disabled="!isManager || resuming"
+            :title="isManager ? 'Resume playback' : 'Only room managers can resume playback'"
+            @click="resumePlayback"
+          >Resume</button>
+          <p v-if="queueItems.length === 0">{{ EMPTY_QUEUE_MESSAGE }}</p>
         </div>
         <div v-else>
           <img
@@ -421,6 +427,8 @@ function onSearchToggle(event) {
 }
 
 const isPlaying = ref(false);
+const resuming = ref(false);
+const EMPTY_QUEUE_MESSAGE = 'Add a song first ლ(´•д• ̀ლ';
 const hasVotedSkip = ref(false);
 const voteOnCooldown = ref(false);
 const playbackPositionMs = ref(0);
@@ -465,7 +473,8 @@ onMounted(async () => {
     await loadRoom();
     await loadSession();
     await syncPlaybackPosition();
-    await Promise.all([loadQueue(), loadCurrentSong(), loadMembers(), loadHistory()]);
+    await Promise.all([loadCurrentSong(), loadMembers(), loadHistory()]);
+    await loadQueue();
     if (isPlaying.value && !currentSong.value && currentExternalId) {
       await loadExternalTrack();
     }
@@ -866,13 +875,26 @@ async function togglePlayPause() {
   try {
     if (isPlaying.value) {
       await apiPost('/playback/pause');
-    } else if (currentSong.value?.song?.id) {
-      await apiPost('/playback/play', { song_id: currentSong.value.song.id });
     } else {
       await apiPost('/playback/play', {});
     }
   } catch (err) {
     handlePlaybackError(err);
+  }
+}
+
+async function resumePlayback() {
+  if (!isManager.value || resuming.value || queueItems.value.length === 0) return;
+  resuming.value = true;
+  try {
+    await apiPost('/playback/play', {});
+    await loadCurrentSong();
+    await loadPlaybackState();
+    await loadQueue();
+  } catch (err) {
+    handlePlaybackError(err);
+  } finally {
+    resuming.value = false;
   }
 }
 
@@ -905,36 +927,15 @@ function setupWebSocket() {
     }
   });
 
-  register('song_changed', async (msg) => {
+  register('song_changed', async () => {
     hasVotedSkip.value = false;
-    if (msg.song && !msg.song.id) {
-      currentSong.value = {
-        id: null,
-        votes_skip: 0,
-        song: msg.song,
-      };
-      isPlaying.value = true;
-      await syncPlaybackPosition();
-      startProgressAnimation();
-    } else {
-      await loadCurrentSong();
-      loadHistory();
-      // COUPLING: brief delay to let the backend finish persisting the new
-      // current song (finish_song updates session state asynchronously before
-      // this song_changed event settles). Without it, the host's auto-play can
-      // fire against a stale current song. 500ms is a heuristic buffer, not a
-      // guaranteed sync point — the real guard is the isPlaying/currentSong
-      // check below.
-      await new Promise((resolve) => setTimeout(resolve, 500));
-      if (isHost.value && !isPlaying.value && currentSong.value) {
-        try {
-          await apiPost('/playback/play', { song_id: currentSong.value.song.id });
-        } catch (err) {
-          handlePlaybackError(err);
-        }
-      }
+    await loadCurrentSong();
+    await syncPlaybackPosition();
+    if (!currentSong.value && currentExternalId && isPlaying.value) {
+      await loadExternalTrack();
     }
-    loadQueue();
+    await Promise.all([loadQueue(), loadHistory()]);
+    if (isPlaying.value) startProgressAnimation();
   });
 
   register('skip_vote', async (msg) => {
@@ -961,14 +962,19 @@ function setupWebSocket() {
   register('playback_state_changed', async (msg) => {
     if (msg.status === 'playing') {
       isPlaying.value = true;
+      await loadCurrentSong();
       await syncPlaybackPosition();
       if (!currentSong.value && currentExternalId) {
         await loadExternalTrack();
       }
+      await loadQueue();
       startProgressAnimation();
     } else if (msg.status === 'stopped') {
       isPlaying.value = false;
       currentSong.value = null;
+      elapsedMs.value = 0;
+      playbackPositionMs.value = 0;
+      await loadQueue();
       if (progressFrame) cancelAnimationFrame(progressFrame);
     } else {
       isPlaying.value = false;

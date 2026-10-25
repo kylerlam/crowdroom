@@ -99,3 +99,33 @@ describe('room administrator controls', () => {
     expect(wrapper.text()).not.toContain('Banned');
   });
 });
+
+describe('idle playback recovery', () => {
+  it('shows the exact empty queue prompt without calling play', async () => {
+    await renderRoom();
+    expect(wrapper.text()).toContain('Add a song first ლ(´•д• ̀ლ');
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+
+  it('lets an administrator resume a queued song', async () => {
+    mocks.userId.value = 'admin';
+    pending = [{ id: 'item', song: { id: 'song', title: 'Next song', artist: 'Artist' } }];
+    await renderRoom();
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiPost).toHaveBeenCalledWith('/playback/play', {});
+  });
+
+  it('disables resume for ordinary members', async () => {
+    mocks.userId.value = 'guest';
+    await renderRoom();
+    expect(wrapper.get('[title="Only room managers can resume playback"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('does not auto-resume from browser song notifications after a pause', async () => {
+    await renderRoom();
+    await mocks.handlers.get('song_changed')({ song: null });
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+});

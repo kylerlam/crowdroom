@@ -60,7 +60,15 @@ class PlaybackService:
             if expected_item_id is not None and current_item.id != expected_item_id:
                 return "finished"
             current_item.playback_status = ItemStatus.FINISHED
-            self._session_repo.update(current_item.session_id, {})
+            self._session_repo.update(
+                current_item.session_id,
+                {
+                    "current_song_id": None,
+                    "playback_status": ItemStatus.STOPPED,
+                    "playback_started_at": None,
+                    "playback_position_ms": 0,
+                },
+            )
 
             self._record_history(session_id, current_item.song_id)
             await self._queue_service.remove_from_queue(current_item.id)

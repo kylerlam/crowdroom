@@ -58,7 +58,23 @@ class PlaybackPollerService:
         """
         with DBSession(engine) as db_session:
             repo = SessionRepository(db_session)
-            repo.update(session_id, {"playback_status": status})
+            session = repo.get_by_id(session_id)
+            current_item = QueueRepository(db_session).get_first_item(session_id)
+            if (
+                current_item
+                and current_item.song
+                and session
+                and current_item.song.external_id == session.current_song_id
+            ):
+                current_item.playback_status = status
+            data = {"playback_status": status}
+            if status == ItemStatus.STOPPED:
+                data.update(
+                    current_song_id=None,
+                    playback_started_at=None,
+                    playback_position_ms=0,
+                )
+            repo.update(session_id, data)
 
     def _update_session_track(
         self, session_id: UUID, track_id: str, status: ItemStatus
@@ -75,6 +91,13 @@ class PlaybackPollerService:
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         with DBSession(engine) as db_session:
             repo = SessionRepository(db_session)
+            current_item = QueueRepository(db_session).get_first_item(session_id)
+            if (
+                current_item
+                and current_item.song
+                and current_item.song.external_id == track_id
+            ):
+                current_item.playback_status = status
             repo.update(
                 session_id,
                 {
@@ -425,6 +448,15 @@ class PlaybackPollerService:
                         backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
                         continue
 
+                    if not state.is_playing and session.playback_status in {
+                        ItemStatus.PAUSED,
+                        ItemStatus.STOPPED,
+                    }:
+                        # Spotify retains the last paused track after a queue
+                        # drains. Do not adopt it again or undo an explicit pause.
+                        backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                        continue
+
                     if state.track_id != session.current_song_id:
                         next_item = self._get_next_queue_item(session.id)
                         next_external_id = (
@@ -543,22 +575,6 @@ class PlaybackPollerService:
                         await self._broadcast_state_changed(
                             room_id, "playing", state.track_id
                         )
-                    elif (
-                        not state.is_playing
-                        and session.playback_status == ItemStatus.PAUSED
-                        and self._is_song_ended(state)
-                    ):
-                        logger.info(
-                            "Room %s: song ended while paused "
-                            "(progress=%s/%s), advancing",
-                            room_id,
-                            state.progress_ms,
-                            state.duration_ms,
-                        )
-                        await self._advance_queue(
-                            session, room_id, host_user_id, adapter
-                        )
-
                     backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
 
                 except asyncio.CancelledError:
