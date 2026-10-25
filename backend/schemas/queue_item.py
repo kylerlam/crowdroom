@@ -54,6 +54,7 @@ class ReadQueueItem(BaseModel):
     position: int = Field(
         ..., ge=0, description="The current position of the song in the queue."
     )
+    is_pinned: bool = False
     votes_skip: int = Field(
         ..., ge=0, description="The current number of skip votes received."
     )
@@ -85,6 +86,12 @@ class QueueItemSong(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class UpdateQueuePin(BaseModel):
+    """Set whether a pending queue item is pinned."""
+
+    is_pinned: bool
+
+
 class QueueItemUser(BaseModel):
     """Inline user data within a queue item detail response.
 
@@ -114,6 +121,7 @@ class ReadQueueItemDetail(BaseModel):
     id: UUID
     session_id: UUID
     position: int = Field(..., ge=0)
+    is_pinned: bool = False
     votes_skip: int = Field(..., ge=0)
     song: QueueItemSong
     added_by: QueueItemUser | None = None

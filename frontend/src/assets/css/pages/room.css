@@ -152,6 +152,43 @@
   overflow-y: auto;
 }
 
+.queue-pinned {
+  background: var(--accent-subtle);
+  border-left: 3px solid var(--accent);
+}
+
+.pin-badge {
+  color: var(--accent);
+}
+
+.queue-pin {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.track-item:hover .queue-pin,
+.track-item:focus-within .queue-pin {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+@media (hover: none) {
+  .queue-pin {
+    opacity: 1;
+    pointer-events: auto;
+  }
+}
+
+.queue-panel .track-item-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.queue-panel .track-item-actions .btn {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-xs);
+}
+
 .members-list {
   display: flex;
   flex-direction: column;

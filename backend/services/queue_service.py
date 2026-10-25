@@ -69,15 +69,12 @@ class QueueService:
             session_id, song_id, added_by_user_id, group
         )
         await self._broadcast_queue_updated(session_id, action="added")
-        # Only announce a song_changed (which makes the host auto-start playback)
-        # when nothing is currently occupying the player. `item.position == 0` is
-        # NOT a reliable "queue was empty" signal because positions are scoped
-        # per-group: the first song added to an empty group always lands at
-        # position 0 even while another group's track is playing. Checking the
-        # session's live playback state prevents the player from jumping to a
-        # freshly-queued song.
-        if item.position == 0 and not self._is_playback_active(session_id):
-            await self._broadcast_song_changed(session_id, item.song)
+        # Group positions restart at zero. Only announce the actual queue head,
+        # and never replace a track that is playing or intentionally paused.
+        if not self._is_playback_active(session_id):
+            first_item = self._queue_repo.get_first_item(session_id)
+            if first_item is not None and first_item.id == item.id:
+                await self._broadcast_song_changed(session_id, item.song)
         return item
 
     def _is_playback_active(self, session_id: UUID) -> bool:
@@ -168,6 +165,14 @@ class QueueService:
             session_id: The session whose queue was reordered.
         """
         await self._broadcast_queue_updated(session_id, action="reordered")
+
+    async def prioritize_item(
+        self, queue_item_id: UUID, is_pinned: bool | None = None
+    ) -> QueueItem:
+        """Prioritize a pending track and notify all room members."""
+        item = self._queue_repo.prioritize_item(queue_item_id, is_pinned)
+        await self.broadcast_queue_reordered(item.session_id)
+        return item
 
     async def _broadcast_queue_updated(self, session_id: UUID, action: str) -> None:
         """Broadcast current queue state to all room members via WebSocket.

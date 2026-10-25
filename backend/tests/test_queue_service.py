@@ -146,6 +146,7 @@ class TestQueueService:
         mock_item.song.album_art_url = None
         mock_item.song.is_explicit = False
         mock_queue_repo.add_to_queue_atomic.return_value = mock_item
+        mock_queue_repo.get_first_item.return_value = mock_item
         mock_queue_repo.get_all_by_session.return_value = []
 
         session_obj = MagicMock()

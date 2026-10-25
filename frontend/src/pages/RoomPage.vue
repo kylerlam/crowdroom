@@ -80,11 +80,38 @@
           </summary>
           <div class="track-list">
             <TrackItem
-              v-for="item in queueItems"
+              v-for="(item, index) in queueItems"
               :key="item.id"
               :track="item.song"
               :added-by="item.added_by?.username || ''"
-            />
+              :class="{ 'queue-pinned': item.is_pinned }"
+            >
+              <template #actions>
+                <span v-if="item.is_pinned" class="pin-badge" title="Pinned priority">
+                  <i class="ph ph-push-pin"></i>
+                  <span class="sr-only">Pinned</span>
+                </span>
+                <template v-if="isManager">
+                  <button
+                    class="btn btn-ghost queue-pin"
+                    :class="{ active: item.is_pinned }"
+                    :aria-label="`${item.is_pinned ? 'Unpin' : 'Pin'} ${item.song.title}`"
+                    :aria-pressed="!!item.is_pinned"
+                    :disabled="queueBusyIds.has(item.id) || (!item.is_pinned && pinnedCount >= 5)"
+                    :title="item.is_pinned ? 'Unpin' : pinnedCount >= 5 ? 'Maximum 5 pinned songs' : 'Pin'"
+                    @click="setQueuePin(item)"
+                  >{{ item.is_pinned ? 'Unpin' : 'Pin' }}</button>
+                  <button
+                    v-if="index > 0"
+                    class="btn btn-ghost queue-jump"
+                    :aria-label="`Jump ${item.song.title}`"
+                    :disabled="queueBusyIds.has(item.id)"
+                    title="Jump to the front of this priority group"
+                    @click="jumpQueueItem(item)"
+                  >Jump</button>
+                </template>
+              </template>
+            </TrackItem>
           </div>
           <div v-if="queueItems.length === 0" class="empty-state">
             <i class="ph ph-playlist"></i>
@@ -409,6 +436,8 @@ const sessionId = ref(null);
 
 const currentSong = ref(null);
 const queueItems = ref([]);
+const queueBusyIds = ref(new Set());
+const pinnedCount = computed(() => queueItems.value.filter((item) => item.is_pinned).length);
 const members = ref([]);
 const bannedUsers = ref([]);
 const history = ref([]);
@@ -608,6 +637,33 @@ async function loadQueue() {
   if (!sessionId.value) return;
   const items = await apiGet(`/queue/?session_id=${sessionId.value}`);
   queueItems.value = stripCurrentSongFromQueue(items);
+}
+
+async function reorderQueueItem(item, pin) {
+  if (!isManager.value || queueBusyIds.value.has(item.id)) return;
+  queueBusyIds.value = new Set(queueBusyIds.value).add(item.id);
+  try {
+    if (pin === undefined) {
+      await apiPost(`/queue/${item.id}/jump`);
+    } else {
+      await apiPatch(`/queue/${item.id}/pin`, { is_pinned: pin });
+    }
+    await loadQueue();
+  } catch (err) {
+    showToast(err.detail || 'Could not update queue');
+  } finally {
+    const next = new Set(queueBusyIds.value);
+    next.delete(item.id);
+    queueBusyIds.value = next;
+  }
+}
+
+function jumpQueueItem(item) {
+  return reorderQueueItem(item);
+}
+
+function setQueuePin(item) {
+  return reorderQueueItem(item, !item.is_pinned);
 }
 
 async function loadCurrentSong() {
@@ -946,15 +1002,9 @@ function setupWebSocket() {
       hasVotedSkip.value = false;
       isPlaying.value = false;
       if (progressFrame) cancelAnimationFrame(progressFrame);
-      // After vote-skip, session.current_song_id stays on the skipped track
-      // until the poller advances Spotify, so /queue/current returns null.
-      // Promote queue[0] locally so the player metadata and vote-skip button
-      // stay visible during the transition.
-      const items = sessionId.value
-        ? await apiGet(`/queue/?session_id=${sessionId.value}`)
-        : [];
-      currentSong.value = items && items.length > 0 ? items[0] : null;
-      queueItems.value = stripCurrentSongFromQueue(items);
+      await loadCurrentSong();
+      await syncPlaybackPosition();
+      await loadQueue();
       loadHistory();
     }
   });

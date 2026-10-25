@@ -8,6 +8,16 @@ from sqlmodel import Session as DBSession
 from sqlmodel import select
 
 from backend.db.models import QueueItem
+from backend.db.models.enum import ItemStatus
+from backend.db.models.session import Session as SessionModel
+from backend.db.models.song import Song
+
+_ACTIVE_STATES = (
+    ItemStatus.NOW_PLAYING,
+    ItemStatus.PLAYING,
+    ItemStatus.PAUSED,
+    ItemStatus.BUFFERING,
+)
 
 
 def _get_dialect_name(session: DBSession) -> str:
@@ -194,17 +204,98 @@ class QueueRepository:
     def get_all_by_session(self, session_id: UUID) -> list[QueueItem]:
         """Retrieve all queue items for a session.
 
-        Ordered by group priority then position.
+        The active track stays first, followed by pins and manual priorities.
         """
         stmt = (
             select(QueueItem)
             .where(QueueItem.session_id == session_id)
+            .order_by(*self._queue_order(session_id))
+        )
+        return self._session.exec(stmt).all()
+
+    def _current_item_id(self, session_id: UUID) -> UUID | None:
+        """Resolve the playing entry without confusing repeated songs."""
+        session = self._session.get(SessionModel, session_id)
+        if (
+            session is None
+            or not session.current_song_id
+            or session.playback_status not in _ACTIVE_STATES
+        ):
+            return None
+        return self._session.exec(
+            select(QueueItem.id)
+            .join(Song, QueueItem.song_id == Song.id)
+            .where(
+                QueueItem.session_id == session_id,
+                Song.external_id == session.current_song_id,
+            )
             .order_by(
+                case((QueueItem.playback_status.in_(_ACTIVE_STATES), 0), else_=1),
                 case((QueueItem.group == "manual", 0), else_=1),
                 QueueItem.position,
             )
+            .limit(1)
+        ).first()
+
+    def _queue_order(self, session_id: UUID) -> tuple:
+        """Use the same ordering for display and playback selection."""
+        current_id = self._current_item_id(session_id)
+        return (
+            case((QueueItem.id == current_id, 0), else_=1),
+            case((QueueItem.is_pinned.is_(True), 0), else_=1),
+            case((QueueItem.priority_position.is_not(None), 0), else_=1),
+            QueueItem.priority_position,
+            case((QueueItem.group == "manual", 0), else_=1),
+            QueueItem.position,
         )
-        return self._session.exec(stmt).all()
+
+    def prioritize_item(
+        self, queue_item_id: UUID, is_pinned: bool | None = None
+    ) -> QueueItem:
+        """Atomically jump or pin a pending track without changing the player.
+
+        Explicit priorities are independent of skip votes and the original
+        manual/playlist positions. A single session lock serializes pin-cap
+        checks and ordering changes across both groups.
+        """
+        item = self.get_by_id(queue_item_id)
+        if item is None:
+            raise ValueError("Queue item no longer exists")
+        with _make_lock(self._session, item.session_id, "priority"):
+            try:
+                self._session.refresh(item)
+                current_id = self._current_item_id(item.session_id)
+                if item.id == current_id:
+                    raise ValueError("The currently playing song cannot be reordered")
+                pending = [
+                    other
+                    for other in self.get_all_by_session(item.session_id)
+                    if other.id != current_id and other.id != item.id
+                ]
+                if is_pinned is not None and item.is_pinned == is_pinned:
+                    self._session.commit()
+                    return item
+                pinned = item.is_pinned if is_pinned is None else is_pinned
+                peers = [other for other in pending if other.is_pinned == pinned]
+                if is_pinned is True and len(peers) >= 5:
+                    raise ValueError("You can pin up to 5 songs")
+                positions = [
+                    other.priority_position
+                    for other in peers
+                    if other.priority_position is not None
+                ]
+                if is_pinned is True:
+                    item.priority_position = max(positions, default=-1) + 1
+                else:
+                    item.priority_position = min(positions, default=1) - 1
+                item.is_pinned = pinned
+                self._session.add(item)
+                self._session.commit()
+                self._session.refresh(item)
+                return item
+            except Exception:
+                self._session.rollback()
+                raise
 
     def get_max_position_in_group(self, session_id: UUID, group: str) -> int:
         """Get the maximum position within a specific group for a session.
@@ -228,10 +319,7 @@ class QueueRepository:
         stmt = (
             select(QueueItem)
             .where(QueueItem.session_id == session_id)
-            .order_by(
-                case((QueueItem.group == "manual", 0), else_=1),
-                QueueItem.position,
-            )
+            .order_by(*self._queue_order(session_id))
             .limit(1)
         )
         return self._session.exec(stmt).first()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from backend.api.websocket import manager
@@ -15,6 +16,9 @@ from backend.core.exceptions import (
 from backend.db.models.queue_vote import QueueVote
 from backend.repositories.queue_vote_repo import QueueVoteRepository
 from backend.services.playback_service import PlaybackService
+
+if TYPE_CHECKING:
+    from backend.services.playback_control_service import PlaybackControlService
 
 _vote_cooldowns: dict[UUID, float] = {}
 
@@ -54,7 +58,12 @@ class QueueVoteService:
                 raise TooManyRequestsException(retry_after=cooldown - elapsed)
         _vote_cooldowns[user_id] = now
 
-    async def cast_vote(self, queue_item_id: UUID, user_id: UUID) -> QueueVote:
+    async def cast_vote(
+        self,
+        queue_item_id: UUID,
+        user_id: UUID,
+        playback_control: PlaybackControlService | None = None,
+    ) -> QueueVote:
         """Cast a skip vote for a specific queue item.
 
         Rejects duplicate votes from the same user on the same queue item.
@@ -65,6 +74,7 @@ class QueueVoteService:
         Args:
             queue_item_id: UUID of the queue item to vote on.
             user_id: UUID of the user casting the vote.
+            playback_control: Starts the next song after a threshold skip.
 
         Returns:
             The newly saved QueueVote instance.
@@ -83,11 +93,15 @@ class QueueVoteService:
         vote = QueueVote(queue_item_id=queue_item_id, user_id=user_id)
         saved_vote = self._repo.create(vote)
 
-        await self._broadcast_and_check_skip(saved_vote)
+        await self._broadcast_and_check_skip(saved_vote, playback_control)
 
         return saved_vote
 
-    async def _broadcast_and_check_skip(self, vote_obj: QueueVote) -> None:
+    async def _broadcast_and_check_skip(
+        self,
+        vote_obj: QueueVote,
+        playback_control: PlaybackControlService | None = None,
+    ) -> None:
         """Broadcast skip_vote event and trigger skip if threshold reached.
 
         Resolves the room context from the vote's queue item chain, broadcasts
@@ -99,6 +113,7 @@ class QueueVoteService:
 
         Args:
             vote_obj: The QueueVote that was just persisted.
+            playback_control: Starts the next song when playback has advanced.
         """
         queue_item = vote_obj.queue_item
         session_obj = queue_item.session
@@ -125,6 +140,8 @@ class QueueVoteService:
             await self._playback_service.finish_song(
                 session_obj.id, expected_item_id=vote_obj.queue_item_id
             )
+            if playback_control:
+                await playback_control.start_if_idle(session_obj.id)
 
         await manager.broadcast(
             {

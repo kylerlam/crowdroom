@@ -155,6 +155,31 @@ class TestSkipVoteBroadcast:
         assert payload["skip_triggered"] is False
         mock_playback.finish_song.assert_not_called()
 
+    @pytest.mark.parametrize("votes, should_start", [(1, False), (3, True)])
+    def test_threshold_skip_starts_next_song_on_server(
+        self,
+        mock_repo,
+        mock_manager,
+        mock_playback,
+        mock_vote_context,
+        votes,
+        should_start,
+    ):
+        mock_vote, _, session_id = mock_vote_context
+        service = QueueVoteService(mock_repo, mock_playback)
+        mock_repo.count_by_item.return_value = votes
+        playback_control = MagicMock()
+        playback_control.start_if_idle = AsyncMock()
+
+        async def run():
+            await service._broadcast_and_check_skip(mock_vote, playback_control)
+
+        anyio.run(run)
+        if should_start:
+            playback_control.start_if_idle.assert_awaited_once_with(session_id)
+        else:
+            playback_control.start_if_idle.assert_not_awaited()
+
     def test_broadcast_skip_vote_threshold_reached(
         self, mock_repo, mock_manager, mock_playback, mock_vote_context
     ):

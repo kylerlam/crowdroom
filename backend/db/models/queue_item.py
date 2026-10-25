@@ -51,6 +51,8 @@ class QueueItem(SQLModel, table=True):
     )
 
     position: int = Field(default=0, nullable=False)
+    is_pinned: bool = Field(default=False, nullable=False)
+    priority_position: int | None = Field(default=None, nullable=True)
     votes_skip: int = Field(default=0, nullable=False)
     group: str = Field(
         default="playlist",

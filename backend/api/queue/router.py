@@ -2,15 +2,18 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from backend.api.auth.dependencies import get_current_user
+from backend.api.playback.dependencies import get_playback_control_service
 from backend.api.queue.dependencies import (
     get_queue_history_repo,
     get_queue_service,
     get_session_repo,
 )
+from backend.api.rooms.dependencies import get_room_service
 from backend.api.session.dependencies import get_queue_vote_service
+from backend.core.exceptions import EntityNotFoundException
 from backend.db.models.user import User
 from backend.repositories.session_repo import SessionRepository
 from backend.schemas.queue_history import ReadQueueHistory
@@ -18,10 +21,13 @@ from backend.schemas.queue_item import (
     CreateQueueItem,
     ReadQueueItem,
     ReadQueueItemDetail,
+    UpdateQueuePin,
 )
 from backend.schemas.queue_vote import CreateQueueVote, ReadQueueVote
+from backend.services.playback_control_service import PlaybackControlService
 from backend.services.queue_service import QueueService
 from backend.services.queue_vote_service import QueueVoteService
+from backend.services.room_service import RoomService
 
 router = APIRouter(prefix="/queue", tags=["queue"])
 
@@ -57,9 +63,8 @@ def get_current_song(
     if item is None or item.song is None:
         return None
     session = session_repo.get_by_id(session_id)
-    if session and session.current_song_id:
-        if item.song.external_id != session.current_song_id:
-            return None
+    if session is None or item.song.external_id != session.current_song_id:
+        return None
     return ReadQueueItemDetail.model_validate(item)
 
 
@@ -91,6 +96,7 @@ async def add_to_queue(
     data: CreateQueueItem,
     queue_service: QueueService = Depends(get_queue_service),
     current_user: User = Depends(get_current_user),
+    playback_control: PlaybackControlService = Depends(get_playback_control_service),
 ) -> ReadQueueItem:
     """Add a song to the end of a specific queue group.
 
@@ -102,6 +108,7 @@ async def add_to_queue(
         data: Schema containing session_id, song_id, and group name.
         queue_service: Dependency-injected queue service instance.
         current_user: Authenticated user adding the song.
+        playback_control: Starts the queue using the creator's Spotify if idle.
 
     Returns:
         ReadQueueItem schema for the newly added queue item.
@@ -112,7 +119,62 @@ async def add_to_queue(
         added_by_user_id=current_user.id,
         group=data.group,
     )
+    await playback_control.start_if_idle(data.session_id)
     return ReadQueueItem.model_validate(item)
+
+
+def _assert_queue_manager(
+    queue_item_id: UUID,
+    queue_service: QueueService,
+    session_repo: SessionRepository,
+    room_service: RoomService,
+    current_user: User,
+) -> None:
+    """Require the owner or a room administrator for queue management."""
+    item = queue_service.get_queue_item(queue_item_id)
+    session = session_repo.get_by_id(item.session_id)
+    if session is None:
+        raise EntityNotFoundException("Session", item.session_id)
+    room_service.assert_manager(session.room_id, current_user.id)
+
+
+@router.post("/{queue_item_id}/jump", response_model=ReadQueueItemDetail)
+async def jump_queue_item(
+    queue_item_id: UUID,
+    queue_service: QueueService = Depends(get_queue_service),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
+    current_user: User = Depends(get_current_user),
+) -> ReadQueueItemDetail:
+    """Move a pending song to the front of its pin or ordinary group."""
+    _assert_queue_manager(
+        queue_item_id, queue_service, session_repo, room_service, current_user
+    )
+    try:
+        item = await queue_service.prioritize_item(queue_item_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return ReadQueueItemDetail.model_validate(item)
+
+
+@router.patch("/{queue_item_id}/pin", response_model=ReadQueueItemDetail)
+async def pin_queue_item(
+    queue_item_id: UUID,
+    data: UpdateQueuePin,
+    queue_service: QueueService = Depends(get_queue_service),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
+    current_user: User = Depends(get_current_user),
+) -> ReadQueueItemDetail:
+    """Pin at most five pending songs, or return one to the ordinary head."""
+    _assert_queue_manager(
+        queue_item_id, queue_service, session_repo, room_service, current_user
+    )
+    try:
+        item = await queue_service.prioritize_item(queue_item_id, data.is_pinned)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return ReadQueueItemDetail.model_validate(item)
 
 
 @router.post("/vote", response_model=ReadQueueVote, status_code=status.HTTP_201_CREATED)
@@ -120,6 +182,7 @@ async def vote_skip(
     data: CreateQueueVote,
     queue_vote_service: QueueVoteService = Depends(get_queue_vote_service),
     current_user: User = Depends(get_current_user),
+    playback_control: PlaybackControlService = Depends(get_playback_control_service),
 ) -> ReadQueueVote:
     """Cast a skip vote for a specific queue item.
 
@@ -132,6 +195,7 @@ async def vote_skip(
         data: Schema containing the queue_item_id to vote on.
         queue_vote_service: Dependency-injected queue vote service instance.
         current_user: Authenticated user casting the vote.
+        playback_control: Starts the next queued song after a threshold skip.
 
     Returns:
         ReadQueueVote schema for the newly cast vote.
@@ -142,6 +206,7 @@ async def vote_skip(
     vote = await queue_vote_service.cast_vote(
         queue_item_id=data.queue_item_id,
         user_id=current_user.id,
+        playback_control=playback_control,
     )
     return ReadQueueVote.model_validate(vote)
 
@@ -172,6 +237,9 @@ async def remove_vote_skip(
 async def remove_from_queue(
     queue_item_id: UUID,
     queue_service: QueueService = Depends(get_queue_service),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
+    current_user: User = Depends(get_current_user),
 ) -> None:
     """Remove a song from the queue.
 
@@ -181,10 +249,16 @@ async def remove_from_queue(
     Args:
         queue_item_id: The unique identifier of the queue item to remove.
         queue_service: Dependency-injected queue service instance.
+        session_repo: Resolves the queue item's room.
+        room_service: Checks room management permissions.
+        current_user: Authenticated owner or room administrator.
 
     Raises:
         EntityNotFoundException: If no queue item exists with the given ID.
     """
+    _assert_queue_manager(
+        queue_item_id, queue_service, session_repo, room_service, current_user
+    )
     await queue_service.remove_from_queue(queue_item_id)
 
 
