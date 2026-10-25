@@ -37,6 +37,19 @@ from backend.services.room_service import RoomService
 router = APIRouter(prefix="/queue", tags=["queue"])
 
 
+def _assert_session_member(
+    session_id: UUID,
+    session_repo: SessionRepository,
+    room_service: RoomService,
+    user: User,
+) -> None:
+    """Resolve a queue's room before permitting a member write."""
+    session = session_repo.get_by_id(session_id, fresh=True)
+    if session is None:
+        raise EntityNotFoundException("Session", session_id)
+    room_service.assert_member(session.room_id, user.id)
+
+
 @router.get(
     "/current",
     response_model=ReadQueueItemDetail | None,
@@ -102,6 +115,8 @@ async def add_to_queue(
     queue_service: QueueService = Depends(get_queue_service),
     current_user: User = Depends(get_current_user),
     playback_control: PlaybackControlService = Depends(get_playback_control_service),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
 ) -> ReadQueueItem:
     """Add a song to the end of a specific queue group.
 
@@ -114,10 +129,13 @@ async def add_to_queue(
         queue_service: Dependency-injected queue service instance.
         current_user: Authenticated user adding the song.
         playback_control: Starts the queue using the creator's Spotify if idle.
+        session_repo: Resolves the target room.
+        room_service: Enforces current room membership.
 
     Returns:
         ReadQueueItem schema for the newly added queue item.
     """
+    _assert_session_member(data.session_id, session_repo, room_service, current_user)
     item = await queue_service.add_to_queue(
         session_id=data.session_id,
         song_id=data.song_id,
@@ -189,6 +207,9 @@ async def vote_skip(
     queue_vote_service: QueueVoteService = Depends(get_queue_vote_service),
     current_user: User = Depends(get_current_user),
     playback_control: PlaybackControlService = Depends(get_playback_control_service),
+    queue_service: QueueService = Depends(get_queue_service),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
 ) -> ReadQueueVote:
     """Cast a skip vote for a specific queue item.
 
@@ -202,6 +223,9 @@ async def vote_skip(
         queue_vote_service: Dependency-injected queue vote service instance.
         current_user: Authenticated user casting the vote.
         playback_control: Starts the next queued song after a threshold skip.
+        queue_service: Resolves the item's session.
+        session_repo: Resolves the target room.
+        room_service: Enforces current room membership.
 
     Returns:
         ReadQueueVote schema for the newly cast vote.
@@ -209,6 +233,8 @@ async def vote_skip(
     Raises:
         EntityExistsException: If the user has already voted on this item.
     """
+    item = queue_service.get_queue_item(data.queue_item_id)
+    _assert_session_member(item.session_id, session_repo, room_service, current_user)
     vote = await queue_vote_service.cast_vote(
         queue_item_id=data.queue_item_id,
         user_id=current_user.id,
@@ -222,6 +248,9 @@ async def remove_vote_skip(
     queue_item_id: UUID,
     queue_vote_service: QueueVoteService = Depends(get_queue_vote_service),
     current_user: User = Depends(get_current_user),
+    queue_service: QueueService = Depends(get_queue_service),
+    session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
 ) -> None:
     """Retract a previously cast skip vote (undo).
 
@@ -229,10 +258,15 @@ async def remove_vote_skip(
         queue_item_id: UUID of the queue item to retract the vote from.
         queue_vote_service: Dependency-injected queue vote service instance.
         current_user: Authenticated user retracting the vote.
+        queue_service: Resolves the item's session.
+        session_repo: Resolves the target room.
+        room_service: Enforces current room membership.
 
     Raises:
         EntityNotFoundException: If no vote exists for this user/item pair.
     """
+    item = queue_service.get_queue_item(queue_item_id)
+    _assert_session_member(item.session_id, session_repo, room_service, current_user)
     await queue_vote_service.remove_vote(
         queue_item_id=queue_item_id,
         user_id=current_user.id,

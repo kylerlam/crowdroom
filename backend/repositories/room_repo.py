@@ -7,6 +7,8 @@ from sqlmodel import Session as DBSession
 from sqlmodel import or_, select
 
 from backend.db.models.room import Room
+from backend.db.models.room_ban import RoomBan
+from backend.db.models.user import User
 
 
 class RoomRepository:
@@ -51,6 +53,18 @@ class RoomRepository:
             Room | None: The room instance if found, otherwise None.
         """
         return self._session.get(Room, room_id)
+
+    def is_member(self, room_id: UUID, user_id: UUID) -> bool:
+        """Check current membership and bans using fresh database state."""
+        user = self._session.get(User, user_id, populate_existing=True)
+        if user is None or user.room_id != room_id:
+            return False
+        ban = self._session.exec(
+            select(RoomBan.id).where(
+                RoomBan.room_id == room_id, RoomBan.user_id == user_id
+            )
+        ).first()
+        return ban is None
 
     def get_all(self) -> list[Room]:
         """Retrieves all rooms in the database.

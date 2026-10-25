@@ -70,6 +70,13 @@ class RoomService:
             raise EntityNotFoundException("Room", room_id)
         return room
 
+    def assert_member(self, room_id: UUID, user_id: UUID) -> Room:
+        """Require an admitted member who is not banned from this room."""
+        room = self.get_room(room_id)
+        if not self._room_repo.is_member(room_id, user_id):
+            raise ForbiddenException("Only current room members can do this")
+        return room
+
     def assert_manager(self, room_id: UUID, user_id: UUID) -> Room:
         """Require the room owner or a delegated administrator still in the room."""
         room = self.get_room(room_id)
