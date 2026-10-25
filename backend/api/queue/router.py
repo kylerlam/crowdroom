@@ -14,6 +14,8 @@ from backend.api.queue.dependencies import (
 from backend.api.rooms.dependencies import get_room_service
 from backend.api.session.dependencies import get_queue_vote_service
 from backend.core.exceptions import EntityNotFoundException
+from backend.db.models.enum import ItemStatus
+from backend.db.models.session import Session
 from backend.db.models.user import User
 from backend.repositories.session_repo import SessionRepository
 from backend.schemas.queue_history import ReadQueueHistory
@@ -24,7 +26,10 @@ from backend.schemas.queue_item import (
     UpdateQueuePin,
 )
 from backend.schemas.queue_vote import CreateQueueVote, ReadQueueVote
-from backend.services.playback_control_service import PlaybackControlService
+from backend.services.playback_control_service import (
+    PlaybackControlService,
+    _room_playback_lock,
+)
 from backend.services.queue_service import QueueService
 from backend.services.queue_vote_service import QueueVoteService
 from backend.services.room_service import RoomService
@@ -129,13 +134,14 @@ def _assert_queue_manager(
     session_repo: SessionRepository,
     room_service: RoomService,
     current_user: User,
-) -> None:
+) -> Session:
     """Require the owner or a room administrator for queue management."""
     item = queue_service.get_queue_item(queue_item_id)
     session = session_repo.get_by_id(item.session_id)
     if session is None:
         raise EntityNotFoundException("Session", item.session_id)
     room_service.assert_manager(session.room_id, current_user.id)
+    return session
 
 
 @router.post("/{queue_item_id}/jump", response_model=ReadQueueItemDetail)
@@ -241,7 +247,7 @@ async def remove_from_queue(
     room_service: RoomService = Depends(get_room_service),
     current_user: User = Depends(get_current_user),
 ) -> None:
-    """Remove a song from the queue.
+    """Remove a pending song from the queue.
 
     Deletes the specified queue item and renumbers subsequent items to
     fill the gap. Requires the item to exist.
@@ -256,10 +262,33 @@ async def remove_from_queue(
     Raises:
         EntityNotFoundException: If no queue item exists with the given ID.
     """
-    _assert_queue_manager(
+    session = _assert_queue_manager(
         queue_item_id, queue_service, session_repo, room_service, current_user
     )
-    await queue_service.remove_from_queue(queue_item_id)
+    session_id = session.id
+    async with _room_playback_lock(session.room_id):
+        session = session_repo.get_by_id(session_id, fresh=True)
+        if session is None:
+            raise EntityNotFoundException("Session", session_id)
+        current = queue_service.get_current_song(session.id)
+        if (
+            current is not None
+            and current.id == queue_item_id
+            and current.song is not None
+            and current.song.external_id == session.current_song_id
+            and session.playback_status
+            in {
+                ItemStatus.NOW_PLAYING,
+                ItemStatus.PLAYING,
+                ItemStatus.PAUSED,
+                ItemStatus.BUFFERING,
+            }
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="This song is already playing. Use Skip to remove it.",
+            )
+        await queue_service.remove_from_queue(queue_item_id)
 
 
 @router.get(

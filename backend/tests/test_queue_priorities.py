@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import anyio
 import pytest
+from fastapi import HTTPException
 from sqlmodel import Session as DBSession
 from sqlmodel import SQLModel, create_engine
 
@@ -24,6 +25,7 @@ from backend.repositories.queue_history_repo import QueueHistoryRepository
 from backend.repositories.queue_repo import QueueRepository
 from backend.repositories.session_repo import SessionRepository
 from backend.schemas.queue_item import UpdateQueuePin
+from backend.services.playback_control_service import _room_playback_lock
 from backend.services.playback_service import PlaybackService
 from backend.services.queue_service import QueueService
 from backend.services.room_service import RoomService
@@ -257,3 +259,79 @@ def test_queue_management_requires_room_manager(action):
     room_service.assert_manager.assert_called_once_with(
         session_repo.get_by_id.return_value.room_id, user.id
     )
+
+
+@pytest.mark.parametrize("playback_status", [ItemStatus.PLAYING, ItemStatus.PAUSED])
+def test_dequeue_rechecks_current_song_after_waiting_for_playback(
+    queue, playback_status
+):
+    """A stale pending row cannot be removed after playback claims it."""
+    db, session, repo, add = queue
+    pending = add("pending")
+    with DBSession(db.get_bind(), expire_on_commit=False) as request_db:
+        sessions = SessionRepository(request_db)
+        cached = sessions.get_by_id(session.id)
+        assert cached.current_song_id is None
+        service = QueueService(QueueRepository(request_db), sessions)
+        rooms = MagicMock(spec=RoomService)
+        user = MagicMock()
+        result = []
+
+        async def run():
+            started = anyio.Event()
+
+            async def dequeue():
+                started.set()
+                try:
+                    await remove_from_queue(pending.id, service, sessions, rooms, user)
+                except HTTPException as error:
+                    result.append(error)
+
+            with patch(
+                "backend.services.queue_service.manager.broadcast", new=AsyncMock()
+            ):
+                async with anyio.create_task_group() as group:
+                    async with _room_playback_lock(session.room_id):
+                        group.start_soon(dequeue)
+                        await started.wait()
+                        session.current_song_id = pending.song.external_id
+                        session.playback_status = playback_status
+                        db.add(session)
+                        db.commit()
+
+        anyio.run(run)
+        assert len(result) == 1
+        assert result[0].status_code == 409
+        assert "Use Skip" in result[0].detail
+        assert repo.get_by_id(pending.id) is not None
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_dequeue_allows_pending_items_while_current_song_is_paused(queue, duplicate):
+    """Only the active entry is protected, including when a queued song repeats it."""
+    db, session, repo, add = queue
+    current = add("current")
+    pending = (
+        repo.add_to_queue_atomic(session.id, current.song_id)
+        if duplicate
+        else add("pending")
+    )
+    session.current_song_id = current.song.external_id
+    session.playback_status = ItemStatus.PAUSED
+    current.playback_status = ItemStatus.PAUSED
+    db.add_all([session, current])
+    db.commit()
+    sessions = SessionRepository(db)
+    service = QueueService(repo, sessions)
+    rooms = MagicMock(spec=RoomService)
+    user = MagicMock()
+
+    async def run():
+        with patch("backend.services.queue_service.manager.broadcast", new=AsyncMock()):
+            await remove_from_queue(pending.id, service, sessions, rooms, user)
+
+    anyio.run(run)
+    assert repo.get_by_id(pending.id) is None
+    assert repo.get_first_item(session.id).id == current.id
+    saved = sessions.get_by_id(session.id, fresh=True)
+    assert saved.playback_status == ItemStatus.PAUSED
