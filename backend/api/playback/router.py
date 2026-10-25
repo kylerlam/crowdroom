@@ -11,10 +11,55 @@ from backend.core.exceptions import (
     SpotifyUpstreamException,
 )
 from backend.db.models.user import User
-from backend.schemas.playback import PlaybackStateResponse, PlayRequest
+from backend.schemas.playback import (
+    PlaybackStateResponse,
+    PlayRequest,
+    SelectSpotifyDeviceRequest,
+    SpotifyDevicesResponse,
+    SpotifyStatusResponse,
+)
 from backend.services.playback_control_service import PlaybackControlService
 
 router = APIRouter(prefix="/playback", tags=["playback"])
+
+
+@router.get("/spotify/status", response_model=SpotifyStatusResponse)
+def get_spotify_status(
+    current_user: User = Depends(get_current_user),
+    service: PlaybackControlService = Depends(get_playback_control_service),
+) -> dict:
+    """Read the host's Spotify authorization status as a room manager."""
+    if not current_user.room_id:
+        raise HTTPException(status_code=400, detail="User is not in any room")
+    return service.get_spotify_status(current_user.room_id, current_user.id)
+
+
+@router.get("/devices", response_model=SpotifyDevicesResponse)
+async def get_devices(
+    current_user: User = Depends(get_current_user),
+    service: PlaybackControlService = Depends(get_playback_control_service),
+) -> dict:
+    """Read available playback devices on the host's Spotify account."""
+    if not current_user.room_id:
+        raise HTTPException(status_code=400, detail="User is not in any room")
+    return await service.get_devices(current_user.room_id, current_user.id)
+
+
+@router.put("/device", status_code=status.HTTP_204_NO_CONTENT)
+async def select_device(
+    body: SelectSpotifyDeviceRequest,
+    current_user: User = Depends(get_current_user),
+    service: PlaybackControlService = Depends(get_playback_control_service),
+) -> None:
+    """Select the room's playback device without starting or changing songs."""
+    if not current_user.room_id:
+        raise HTTPException(status_code=400, detail="User is not in any room")
+    try:
+        await service.select_device(
+            current_user.room_id, current_user.id, body.device_id
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @router.post("/play", status_code=status.HTTP_204_NO_CONTENT)

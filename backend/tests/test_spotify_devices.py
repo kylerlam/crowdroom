@@ -1,0 +1,351 @@
+"""Spotify device recovery preserves authorization, queue order and permissions."""
+
+from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import uuid4
+
+import anyio
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+
+from backend.adapters.spotify_playback_adapter import SpotifyPlaybackAdapter
+from backend.api.auth.dependencies import get_current_user
+from backend.api.playback.dependencies import get_playback_control_service
+from backend.core.security import SecurityService
+from backend.db.models import Room, User
+from backend.db.models.enum import ItemStatus
+from backend.db.models.session import Session
+from backend.main import app
+from backend.repositories.room_repo import RoomRepository
+from backend.services.platform_connection_service import PlatformConnectionService
+from backend.services.playback_control_service import PlaybackControlService
+from backend.services.playback_poller_service import PlaybackPollerService
+from backend.services.room_service import RoomService
+
+
+def device(device_id, *, active=False, restricted=False):
+    """Create a non-secret Spotify Connect device fixture."""
+    return {
+        "id": device_id,
+        "name": "Browser",
+        "type": "computer",
+        "is_active": active,
+        "is_restricted": restricted,
+    }
+
+
+def response(status):
+    """Build a real HTTP response so failures exercise raise_for_status."""
+    return httpx.Response(
+        status,
+        request=httpx.Request("PUT", "https://api.spotify.com/v1/me/player/play"),
+    )
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize(
+    "preferred,expected", [("chosen", "chosen"), ("stale", "active"), (None, "active")]
+)
+def test_missing_device_rediscovery_preserves_command_and_retries_once(
+    resume, preferred, expected
+):
+    """A 404 uses the saved device when available, then the active device."""
+    adapter = SpotifyPlaybackAdapter("token")
+    adapter.get_devices = AsyncMock(
+        return_value=[
+            device("restricted", active=True, restricted=True),
+            device("chosen"),
+            device("active", active=True),
+        ]
+    )
+    adapter.transfer = AsyncMock()
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.put.side_effect = [response(404), response(204)]
+
+    async def run():
+        with patch(
+            "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
+            return_value=client,
+        ):
+            return await (
+                adapter.resume(preferred)
+                if resume
+                else adapter.play("spotify:track:first", preferred)
+            )
+
+    assert anyio.run(run) == expected
+    adapter.get_devices.assert_awaited_once()
+    adapter.transfer.assert_awaited_once_with(expected)
+    assert client.put.await_count == 2
+    retried = client.put.await_args_list[1].kwargs
+    assert retried["params"] == {"device_id": expected}
+    if resume:
+        assert "json" not in retried
+    else:
+        assert retried["json"] == {"uris": ["spotify:track:first"]}
+
+
+def test_inactive_available_device_can_be_selected_after_default_404():
+    """An online browser need not already be Spotify's active player."""
+    adapter = SpotifyPlaybackAdapter("token")
+    adapter.get_devices = AsyncMock(return_value=[device("browser")])
+    adapter.transfer = AsyncMock()
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.put.side_effect = [response(404), response(204)]
+
+    async def run():
+        with patch(
+            "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
+            return_value=client,
+        ):
+            return await adapter.play("spotify:track:first")
+
+    assert anyio.run(run) == "browser"
+    adapter.transfer.assert_awaited_once_with("browser")
+
+
+@pytest.mark.parametrize(
+    "devices", [[], [device(None)], [device("blocked", restricted=True)]]
+)
+def test_offline_or_restricted_devices_do_not_retry_forever(devices):
+    """A missing browser cannot be created or authorized by retrying play."""
+    adapter = SpotifyPlaybackAdapter("token")
+    adapter.get_devices = AsyncMock(return_value=devices)
+    adapter.transfer = AsyncMock()
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.put.return_value = response(404)
+
+    async def run():
+        with patch(
+            "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
+            return_value=client,
+        ):
+            await adapter.play("spotify:track:first")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        anyio.run(run)
+    client.put.assert_awaited_once()
+    adapter.transfer.assert_not_awaited()
+
+
+def test_transfer_preserves_playing_or_paused_state():
+    """Selecting a browser is not an implicit Resume command."""
+    adapter = SpotifyPlaybackAdapter("token")
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.put.return_value = response(204)
+
+    async def run():
+        with patch(
+            "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
+            return_value=client,
+        ):
+            await adapter.transfer("browser")
+
+    anyio.run(run)
+    assert client.put.await_args.kwargs["json"] == {
+        "device_ids": ["browser"],
+        "play": False,
+    }
+
+
+def test_device_404_retry_is_bounded_even_if_transfer_succeeds():
+    """An unavailable web player cannot cause an unbounded retry loop."""
+    adapter = SpotifyPlaybackAdapter("token")
+    adapter.get_devices = AsyncMock(return_value=[device("browser")])
+    adapter.transfer = AsyncMock()
+    client = AsyncMock()
+    client.__aenter__.return_value = client
+    client.put.return_value = response(404)
+
+    async def run():
+        with patch(
+            "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
+            return_value=client,
+        ):
+            await adapter.resume("browser")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        anyio.run(run)
+    assert client.put.await_count == 2
+    adapter.transfer.assert_awaited_once()
+
+
+@pytest.fixture
+def manager_client():
+    """Use real role checks and playback service with a mocked Spotify boundary."""
+    room_id = uuid4()
+    host = User(username="host", room_id=room_id)
+    admin = User(username="admin", room_id=room_id)
+    member = User(username="member", room_id=room_id)
+    room = Room(
+        id=room_id,
+        room_name="Music",
+        room_code="ABCDEF",
+        host_user_id=host.id,
+        settings={"admin_user_ids": [str(admin.id)]},
+    )
+    room.users = [host, admin, member]
+    room_repo = MagicMock(spec=RoomRepository)
+    room_repo.get_by_id.return_value = room
+    rooms = RoomService(room_repo, MagicMock(spec=SecurityService))
+    session = Session(
+        room_id=room_id, current_device_id="saved", playback_status=ItemStatus.PAUSED
+    )
+    sessions = MagicMock()
+    sessions.get_by_room.return_value = session
+    connections = MagicMock(spec=PlatformConnectionService)
+    connections.is_spotify_authorized.return_value = True
+    connections.get_valid_access_token = AsyncMock(return_value="host-token")
+    service = PlaybackControlService(
+        rooms, sessions, MagicMock(), connections, MagicMock(), MagicMock()
+    )
+    adapter = AsyncMock()
+    adapter.get_devices.return_value = [device("browser")]
+    actor = {"user": host}
+    app.dependency_overrides[get_current_user] = lambda: actor["user"]
+    app.dependency_overrides[get_playback_control_service] = lambda: service
+    with patch.object(service, "_get_adapter", new=AsyncMock(return_value=adapter)):
+        yield TestClient(app), actor, host, admin, member, service, session, adapter
+    app.dependency_overrides.pop(get_current_user, None)
+    app.dependency_overrides.pop(get_playback_control_service, None)
+
+
+@pytest.mark.parametrize("role", ["host", "admin", "member"])
+@pytest.mark.parametrize("operation", ["status", "devices", "select"])
+def test_only_managers_can_read_host_authorization_and_control_devices(
+    manager_client, role, operation
+):
+    """Ordinary members cannot infer Spotify authorization through either API."""
+    client, actor, host, admin, member, service, session, adapter = manager_client
+    actor["user"] = {"host": host, "admin": admin, "member": member}[role]
+    if operation == "select":
+        result = client.put("/api/v1/playback/device", json={"device_id": "browser"})
+    else:
+        suffix = "spotify/status" if operation == "status" else "devices"
+        result = client.get(f"/api/v1/playback/{suffix}")
+    if role == "member":
+        assert result.status_code == 403
+        adapter.get_devices.assert_not_awaited()
+        service._platform_connection_service.is_spotify_authorized.assert_not_called()
+    else:
+        assert result.status_code == (204 if operation == "select" else 200)
+        if operation == "status":
+            assert result.json() == {"authorized": True}
+            service._platform_connection_service.is_spotify_authorized.assert_called_once_with(
+                host.id
+            )
+        elif operation == "devices":
+            assert result.json() == {
+                "devices": [device("browser")],
+                "selected_device_id": "saved",
+            }
+        else:
+            adapter.transfer.assert_awaited_once_with("browser")
+            adapter.play.assert_not_awaited()
+            adapter.resume.assert_not_awaited()
+            service._session_repo.update.assert_called_once_with(
+                session.id, {"current_device_id": "browser"}
+            )
+            assert session.playback_status == ItemStatus.PAUSED
+
+
+def test_unavailable_device_selection_does_not_change_saved_target(manager_client):
+    """A stale UI device is rejected before altering room state."""
+    client, _, _, _, _, service, _, adapter = manager_client
+    result = client.put("/api/v1/playback/device", json={"device_id": "gone"})
+    assert result.status_code == 400
+    service._session_repo.update.assert_not_called()
+    adapter.transfer.assert_not_awaited()
+
+
+def test_pause_while_device_offline_still_preserves_manager_intent(manager_client):
+    """An offline browser cannot leave the room stuck in the playing state."""
+    client, _, _, _, _, service, session, adapter = manager_client
+    session.playback_status = ItemStatus.PLAYING
+    adapter.pause.side_effect = httpx.HTTPStatusError(
+        "offline", request=response(404).request, response=response(404)
+    )
+    result = client.post("/api/v1/playback/pause")
+    assert result.status_code == 204
+    adapter.pause.assert_awaited_once_with("saved")
+    service._session_repo.update.assert_called_once_with(
+        session.id, {"playback_status": ItemStatus.PAUSED}
+    )
+    adapter.transfer.assert_not_awaited()
+
+
+@pytest.mark.parametrize("available", [[], [device("other-browser")]])
+def test_missing_playback_does_not_finish_a_track_early(available):
+    """Device loss must not skip a song even if another player remains online."""
+    poller = PlaybackPollerService()
+    session = Session(
+        room_id=uuid4(), playback_status=ItemStatus.PLAYING, current_song_id="first"
+    )
+    adapter = AsyncMock()
+    adapter.get_current_playback.return_value = None
+    adapter.get_devices.return_value = available
+    current_item = MagicMock()
+    current_item.song.external_id = "first"
+    current_item.song.duration = 180
+
+    async def run():
+        with (
+            patch("backend.services.playback_poller_service.settings") as config,
+            patch(
+                "backend.services.playback_poller_service.SpotifyPlaybackAdapter",
+                return_value=adapter,
+            ),
+            patch.object(
+                poller, "_get_session_state", side_effect=[session, session, None]
+            ),
+            patch.object(poller, "_get_current_queue_item", return_value=current_item),
+            patch.object(poller, "_update_session_status") as update_status,
+            patch.object(poller, "_broadcast_state_changed", new=AsyncMock()),
+            patch.object(
+                poller, "_get_valid_token", new=AsyncMock(return_value="token")
+            ),
+            patch.object(poller, "_advance_queue", new=AsyncMock()) as advance,
+        ):
+            config.PLAYBACK_POLL_INTERVAL_SECONDS = 0
+            await poller._poll_loop(session.room_id, uuid4())
+            advance.assert_not_awaited()
+            update_status.assert_called_once_with(session.id, ItemStatus.PAUSED, 0)
+
+    anyio.run(run)
+
+
+def test_poller_renews_an_early_rejected_token_before_retrying_playback_state():
+    """A Spotify 401 is not left looping until the stored expiry timestamp."""
+    poller = PlaybackPollerService()
+    session = Session(room_id=uuid4(), playback_status=ItemStatus.STOPPED)
+    host_id = uuid4()
+    rejected = AsyncMock()
+    rejected.get_current_playback.side_effect = httpx.HTTPStatusError(
+        "expired", request=response(401).request, response=response(401)
+    )
+    renewed = AsyncMock()
+    renewed.get_current_playback.return_value = None
+
+    async def run():
+        with (
+            patch("backend.services.playback_poller_service.settings") as config,
+            patch(
+                "backend.services.playback_poller_service.SpotifyPlaybackAdapter",
+                side_effect=[rejected, renewed],
+            ),
+            patch.object(poller, "_get_session_state", side_effect=[session, None]),
+            patch.object(
+                poller, "_get_valid_token", new=AsyncMock(return_value="token")
+            ) as get_token,
+        ):
+            config.PLAYBACK_POLL_INTERVAL_SECONDS = 0
+            await poller._poll_loop(session.room_id, host_id)
+            assert get_token.await_count == 2
+            assert get_token.await_args_list[1].kwargs == {"force_refresh": True}
+            renewed.get_current_playback.assert_awaited_once()
+
+    anyio.run(run)

@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from uuid import UUID
 
 import httpx
@@ -23,6 +24,7 @@ from backend.db.models.song import Song
 from backend.repositories.platform_connection_repo import PlatformConnectionRepo
 from backend.repositories.queue_history_repo import QueueHistoryRepository
 from backend.repositories.queue_repo import QueueRepository
+from backend.repositories.room_repo import RoomRepository
 from backend.repositories.session_repo import SessionRepository
 from backend.repositories.song_repo import SongRepository
 from backend.services.platform_connection_service import PlatformConnectionService
@@ -53,12 +55,15 @@ class PlaybackPollerService:
             repo = SessionRepository(db_session)
             return repo.get_by_room(room_id)
 
-    def _update_session_status(self, session_id: UUID, status: ItemStatus) -> None:
+    def _update_session_status(
+        self, session_id: UUID, status: ItemStatus, position_ms: int | None = None
+    ) -> None:
         """Update a session's playback_status in a fresh DB connection.
 
         Args:
             session_id: The session to update.
             status: The new playback status.
+            position_ms: Optional position to retain after a device disconnects.
         """
         with DBSession(engine) as db_session:
             repo = SessionRepository(db_session)
@@ -72,6 +77,8 @@ class PlaybackPollerService:
             ):
                 current_item.playback_status = status
             data = {"playback_status": status}
+            if position_ms is not None:
+                data["playback_position_ms"] = position_ms
             if status == ItemStatus.STOPPED:
                 data.update(
                     current_song_id=None,
@@ -81,7 +88,11 @@ class PlaybackPollerService:
             repo.update(session_id, data)
 
     def _update_session_track(
-        self, session_id: UUID, track_id: str, status: ItemStatus
+        self,
+        session_id: UUID,
+        track_id: str,
+        status: ItemStatus,
+        device_id: str | None = None,
     ) -> None:
         """Update a session's current track, status, and timing.
 
@@ -89,6 +100,7 @@ class PlaybackPollerService:
             session_id: The session to update.
             track_id: The new Spotify track ID.
             status: The new playback status.
+            device_id: Selected Spotify Connect device, if known.
         """
         from datetime import datetime, timezone
 
@@ -102,17 +114,19 @@ class PlaybackPollerService:
                 and current_item.song.external_id == track_id
             ):
                 current_item.playback_status = status
-            repo.update(
-                session_id,
-                {
-                    "current_song_id": track_id,
-                    "playback_status": status,
-                    "playback_started_at": now_naive,
-                    "playback_position_ms": 0,
-                },
-            )
+            data = {
+                "current_song_id": track_id,
+                "playback_status": status,
+                "playback_started_at": now_naive,
+                "playback_position_ms": 0,
+            }
+            if device_id:
+                data["current_device_id"] = device_id
+            repo.update(session_id, data)
 
-    async def _get_valid_token(self, host_user_id: UUID) -> str:
+    async def _get_valid_token(
+        self, host_user_id: UUID, *, force_refresh: bool = False
+    ) -> str:
         """Get a valid Spotify access token for the host user.
 
         Opens a fresh DB connection, builds PlatformConnectionService,
@@ -120,6 +134,7 @@ class PlaybackPollerService:
 
         Args:
             host_user_id: The host user whose token to retrieve.
+            force_refresh: Renew once after Spotify rejects the current token.
 
         Returns:
             A valid Spotify access token string.
@@ -127,6 +142,10 @@ class PlaybackPollerService:
         with DBSession(engine) as db_session:
             repo = PlatformConnectionRepo(db_session)
             service = PlatformConnectionService(repo)
+            if force_refresh:
+                return await service.force_refresh_token(
+                    host_user_id, StreamingPlatforms.SPOTIFY
+                )
             return await service.get_valid_access_token(
                 host_user_id, StreamingPlatforms.SPOTIFY
             )
@@ -318,15 +337,19 @@ class PlaybackPollerService:
         )
         logger.info("Room %s: advance_queue next_uri=%s", room_id, next_uri)
 
+        saved_device = session.current_device_id
+        device_id = saved_device if isinstance(saved_device, str) else None
         if next_uri:
             try:
-                await adapter.play(next_uri)
+                resolved_device = await adapter.play(next_uri, device_id)
             except httpx.HTTPStatusError as error:
                 if error.response.status_code == 401:
                     try:
-                        token = await self._get_valid_token(host_user_id)
+                        token = await self._get_valid_token(
+                            host_user_id, force_refresh=True
+                        )
                         adapter = SpotifyPlaybackAdapter(token)
-                        await adapter.play(next_uri)
+                        resolved_device = await adapter.play(next_uri, device_id)
                     except httpx.HTTPStatusError:
                         logger.warning(
                             "Failed to auto-play next track for room %s "
@@ -342,11 +365,14 @@ class PlaybackPollerService:
                     )
                     return
             track_id = next_uri.split(":")[-1]
+            if isinstance(resolved_device, str):
+                device_id = resolved_device
             await asyncio.to_thread(
                 self._update_session_track,
                 session.id,
                 track_id,
                 ItemStatus.PLAYING,
+                device_id,
             )
             await self._broadcast_state_changed(room_id, "playing", track_id)
             if not queue_owns_current:
@@ -357,7 +383,7 @@ class PlaybackPollerService:
                 )
         else:
             try:
-                await adapter.pause()
+                await (adapter.pause(device_id) if device_id else adapter.pause())
             except httpx.HTTPStatusError:
                 pass
             await asyncio.to_thread(
@@ -449,7 +475,16 @@ class PlaybackPollerService:
 
                     token = await self._get_valid_token(host_user_id)
                     adapter = SpotifyPlaybackAdapter(token)
-                    state = await adapter.get_current_playback()
+                    try:
+                        state = await adapter.get_current_playback()
+                    except httpx.HTTPStatusError as error:
+                        if error.response.status_code != 401:
+                            raise
+                        token = await self._get_valid_token(
+                            host_user_id, force_refresh=True
+                        )
+                        adapter = SpotifyPlaybackAdapter(token)
+                        state = await adapter.get_current_playback()
 
                     logger.info(
                         "Poll room %s: state=%s, session_status=%s, session_track=%s",
@@ -461,6 +496,66 @@ class PlaybackPollerService:
 
                     if state is None:
                         if session.playback_status == ItemStatus.PLAYING:
+                            current_item = await asyncio.to_thread(
+                                self._get_current_queue_item, session.id
+                            )
+                            position_ms = session.playback_position_ms or 0
+                            if isinstance(session.playback_started_at, datetime):
+                                position_ms += int(
+                                    (
+                                        datetime.now(timezone.utc).replace(tzinfo=None)
+                                        - session.playback_started_at.replace(
+                                            tzinfo=None
+                                        )
+                                    ).total_seconds()
+                                    * 1000
+                                )
+                            duration = (
+                                current_item.song.duration
+                                if current_item
+                                and current_item.song
+                                and current_item.song.external_id
+                                == session.current_song_id
+                                else None
+                            )
+                            ended = (
+                                isinstance(duration, (int, float))
+                                and duration > 0
+                                and position_ms >= duration * 1000
+                            )
+                            if not ended:
+                                # Device loss alone must not skip or restart a song.
+                                async with _room_playback_lock(room_id):
+                                    latest = await asyncio.to_thread(
+                                        self._get_session_state, room_id
+                                    )
+                                    if latest and (
+                                        latest.playback_status == ItemStatus.PLAYING
+                                        and latest.current_song_id
+                                        == session.current_song_id
+                                        and latest.playback_started_at
+                                        == session.playback_started_at
+                                    ):
+                                        await asyncio.to_thread(
+                                            self._update_session_status,
+                                            session.id,
+                                            ItemStatus.PAUSED,
+                                            position_ms,
+                                        )
+                                        await self._broadcast_state_changed(
+                                            room_id, "paused", session.current_song_id
+                                        )
+                                backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                                continue
+                            devices = await adapter.get_devices()
+                            if not any(
+                                device["id"] and not device["is_restricted"]
+                                for device in devices
+                            ):
+                                # Missing devices are not an end-of-song event.
+                                # Keep the current queue item until Spotify returns.
+                                backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                                continue
                             logger.info(
                                 "Room %s: Spotify idle (was playing), advancing",
                                 room_id,
@@ -631,7 +726,20 @@ class PlaybackPollerService:
                         "Room %s: host has no OAuth connection, stopping poller",
                         room_id,
                     )
-                    await manager.broadcast(
+                    with DBSession(engine) as db_session:
+                        room = RoomRepository(db_session).get_by_id(room_id)
+                        recipients = (
+                            {room.host_user_id}
+                            | {
+                                user.id
+                                for user in room.users
+                                if user.id in room.admin_user_ids
+                                and user.room_id == room_id
+                            }
+                            if room
+                            else set()
+                        )
+                    await manager.broadcast_to_users(
                         {
                             "type": "error",
                             "code": "oauth_required",
@@ -639,6 +747,7 @@ class PlaybackPollerService:
                             "room_id": str(room_id),
                         },
                         str(room_id),
+                        recipients,
                     )
                     break
                 except Exception:

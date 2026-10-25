@@ -109,6 +109,31 @@ class PlaybackControlService:
         )
         return SpotifyPlaybackAdapter(token)
 
+    async def _start_on_device(
+        self,
+        adapter: SpotifyPlaybackAdapter,
+        host_user_id: UUID,
+        device_id: str | None,
+        track_uri: str | None = None,
+    ) -> str | None:
+        """Renew a rejected token once, keeping the same device and command."""
+        for attempt in range(2):
+            try:
+                resolved = (
+                    await adapter.play(track_uri, device_id)
+                    if track_uri
+                    else await adapter.resume(device_id)
+                )
+                return resolved if isinstance(resolved, str) else device_id
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code == 401 and not attempt:
+                    adapter = await self._get_fresh_adapter(host_user_id)
+                    continue
+                raise SpotifyUpstreamException(
+                    status_code=error.response.status_code,
+                    detail=self._spotify_error_detail(error),
+                ) from error
+
     async def start_if_idle(self, session_id: UUID) -> None:
         """Auto-start the queue after an addition, unless playback was paused.
 
@@ -185,6 +210,9 @@ class PlaybackControlService:
         host_user_id = room.host_user_id
 
         session = self._session_repo.get_by_room(room_id, fresh=True)
+        if device_id is None and session:
+            saved_device = session.current_device_id
+            device_id = saved_device if isinstance(saved_device, str) else None
         if song_id is None and (
             session is None
             or not session.current_song_id
@@ -199,17 +227,7 @@ class PlaybackControlService:
 
         if song_id is None:
             adapter = await self._get_adapter(host_user_id)
-            try:
-                await adapter.resume(device_id)
-            except httpx.HTTPStatusError as error:
-                if error.response.status_code == 401:
-                    adapter = await self._get_fresh_adapter(host_user_id)
-                    await adapter.resume(device_id)
-                else:
-                    raise SpotifyUpstreamException(
-                        status_code=error.response.status_code,
-                        detail=self._spotify_error_detail(error),
-                    ) from error
+            device_id = await self._start_on_device(adapter, host_user_id, device_id)
             if session:
                 current_item = self._queue_service.get_current_song(session.id)
                 if (
@@ -222,6 +240,7 @@ class PlaybackControlService:
                     {
                         "playback_status": ItemStatus.PLAYING,
                         "playback_started_at": _utcnow(),
+                        "current_device_id": device_id,
                     },
                 )
             await self._broadcast_state_changed(
@@ -254,24 +273,12 @@ class PlaybackControlService:
             and session.playback_status == ItemStatus.PAUSED
         )
 
-        try:
-            if is_resume:
-                await adapter.resume(device_id)
-            else:
-                track_uri = f"spotify:track:{song.external_id}"
-                await adapter.play(track_uri, device_id)
-        except httpx.HTTPStatusError as error:
-            if error.response.status_code == 401:
-                adapter = await self._get_fresh_adapter(host_user_id)
-                if is_resume:
-                    await adapter.resume(device_id)
-                else:
-                    await adapter.play(track_uri, device_id)
-            else:
-                raise SpotifyUpstreamException(
-                    status_code=error.response.status_code,
-                    detail=self._spotify_error_detail(error),
-                ) from error
+        device_id = await self._start_on_device(
+            adapter,
+            host_user_id,
+            device_id,
+            None if is_resume else f"spotify:track:{song.external_id}",
+        )
 
         now = _utcnow()
         resume_position = session.playback_position_ms or 0 if is_resume else 0
@@ -285,7 +292,7 @@ class PlaybackControlService:
                 {
                     "playback_status": ItemStatus.PLAYING,
                     "current_song_id": song.external_id,
-                    "current_device_id": device_id or session.current_device_id,
+                    "current_device_id": device_id,
                     "playback_started_at": now,
                     "playback_position_ms": resume_position,
                 },
@@ -316,20 +323,29 @@ class PlaybackControlService:
         """Pause while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
         host_user_id = room.host_user_id
+        session = self._session_repo.get_by_room(room_id, fresh=True)
+        saved_device = session.current_device_id if session else None
+        device_id = saved_device if isinstance(saved_device, str) else None
         adapter = await self._get_adapter(host_user_id)
         try:
-            await adapter.pause()
+            await (adapter.pause(device_id) if device_id else adapter.pause())
         except httpx.HTTPStatusError as error:
             if error.response.status_code == 401:
                 adapter = await self._get_fresh_adapter(host_user_id)
-                await adapter.pause()
-            else:
+                try:
+                    await (adapter.pause(device_id) if device_id else adapter.pause())
+                except httpx.HTTPStatusError as refreshed_error:
+                    if refreshed_error.response.status_code != 404:
+                        raise SpotifyUpstreamException(
+                            status_code=refreshed_error.response.status_code,
+                            detail=self._spotify_error_detail(refreshed_error),
+                        ) from refreshed_error
+            elif error.response.status_code != 404:
                 raise SpotifyUpstreamException(
                     status_code=error.response.status_code,
                     detail=self._spotify_error_detail(error),
                 ) from error
 
-        session = self._session_repo.get_by_room(room_id, fresh=True)
         if session:
             current_item = self._queue_service.get_current_song(session.id)
             if (
@@ -383,17 +399,13 @@ class PlaybackControlService:
         if next_item and next_item.song:
             track_uri = f"spotify:track:{next_item.song.external_id}"
             adapter = await self._get_adapter(host_user_id)
-            try:
-                await adapter.play(track_uri)
-            except httpx.HTTPStatusError as error:
-                if error.response.status_code == 401:
-                    adapter = await self._get_fresh_adapter(host_user_id)
-                    await adapter.play(track_uri)
-                else:
-                    raise SpotifyUpstreamException(
-                        status_code=error.response.status_code,
-                        detail=self._spotify_error_detail(error),
-                    ) from error
+            saved_device = session.current_device_id
+            device_id = await self._start_on_device(
+                adapter,
+                host_user_id,
+                saved_device if isinstance(saved_device, str) else None,
+                track_uri,
+            )
             next_item.playback_status = ItemStatus.PLAYING
             self._session_repo.update(
                 session.id,
@@ -402,6 +414,7 @@ class PlaybackControlService:
                     "current_song_id": next_item.song.external_id,
                     "playback_started_at": _utcnow(),
                     "playback_position_ms": 0,
+                    "current_device_id": device_id,
                 },
             )
             await self._broadcast_state_changed(
@@ -412,7 +425,12 @@ class PlaybackControlService:
         else:
             adapter = await self._get_adapter(host_user_id)
             try:
-                await adapter.pause()
+                saved_device = session.current_device_id if session else None
+                await (
+                    adapter.pause(saved_device)
+                    if isinstance(saved_device, str)
+                    else adapter.pause()
+                )
             except httpx.HTTPStatusError:
                 pass
             if session:
@@ -450,6 +468,69 @@ class PlaybackControlService:
                 status_code=error.response.status_code,
                 detail=self._spotify_error_detail(error),
             ) from error
+
+    def get_spotify_status(self, room_id: UUID, user_id: UUID) -> dict:
+        """Expose the host's saved authorization only to room managers."""
+        room = self._room_service.assert_manager(room_id, user_id)
+        return {
+            "authorized": self._platform_connection_service.is_spotify_authorized(
+                room.host_user_id
+            )
+        }
+
+    async def get_devices(self, room_id: UUID, user_id: UUID) -> dict:
+        """List the host's Connect devices and the room's saved preference."""
+        room = self._room_service.assert_manager(room_id, user_id)
+        adapter = await self._get_adapter(room.host_user_id)
+        for attempt in range(2):
+            try:
+                devices = await adapter.get_devices()
+                break
+            except httpx.HTTPStatusError as error:
+                if error.response.status_code == 401 and not attempt:
+                    adapter = await self._get_fresh_adapter(room.host_user_id)
+                    continue
+                raise SpotifyUpstreamException(
+                    status_code=error.response.status_code,
+                    detail=self._spotify_error_detail(error),
+                ) from error
+        session = self._session_repo.get_by_room(room_id, fresh=True)
+        return {
+            "devices": devices,
+            "selected_device_id": session.current_device_id if session else None,
+        }
+
+    async def select_device(self, room_id: UUID, user_id: UUID, device_id: str) -> None:
+        """Transfer to an available device without overriding a deliberate pause."""
+        async with _room_playback_lock(room_id):
+            room = self._room_service.assert_manager(room_id, user_id)
+            session = self._session_repo.get_by_room(room_id, fresh=True)
+            if session is None:
+                raise ValueError("The room has no active session")
+            adapter = await self._get_adapter(room.host_user_id)
+            for attempt in range(2):
+                try:
+                    devices = await adapter.get_devices()
+                    device = next(
+                        (item for item in devices if item["id"] == device_id), None
+                    )
+                    if not device or device["is_restricted"]:
+                        raise ValueError(
+                            "This Spotify device is unavailable. "
+                            "Refresh devices and try again."
+                        )
+                    if not device["is_active"]:
+                        await adapter.transfer(device_id)
+                    break
+                except httpx.HTTPStatusError as error:
+                    if error.response.status_code == 401 and not attempt:
+                        adapter = await self._get_fresh_adapter(room.host_user_id)
+                        continue
+                    raise SpotifyUpstreamException(
+                        status_code=error.response.status_code,
+                        detail=self._spotify_error_detail(error),
+                    ) from error
+            self._session_repo.update(session.id, {"current_device_id": device_id})
 
     async def _broadcast_state_changed(
         self, room_id: UUID, playback_status: str, track_id: str | None = None

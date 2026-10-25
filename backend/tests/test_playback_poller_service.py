@@ -385,7 +385,11 @@ class TestPollLoopExternalPause:
 class TestPollLoopNoDevice:
     @patch("backend.services.playback_poller_service.SpotifyPlaybackAdapter")
     @patch("backend.services.playback_poller_service.settings")
-    def test_no_device_advances_queue(self, mock_settings, mock_adapter_cls):
+    def test_idle_player_with_available_device_advances_queue(
+        self, mock_settings, mock_adapter_cls
+    ):
+        from datetime import datetime, timedelta
+
         mock_settings.PLAYBACK_POLL_INTERVAL_SECONDS = 0
 
         poller = PlaybackPollerService()
@@ -397,6 +401,11 @@ class TestPollLoopNoDevice:
         mock_session.id = session_id
         mock_session.current_song_id = "track_123"
         mock_session.playback_status = ItemStatus.PLAYING
+        mock_session.playback_position_ms = 0
+        mock_session.playback_started_at = datetime.now() - timedelta(minutes=4)
+        current_item = MagicMock()
+        current_item.song.external_id = "track_123"
+        current_item.song.duration = 180
 
         call_count = 0
 
@@ -409,10 +418,16 @@ class TestPollLoopNoDevice:
 
         mock_adapter = AsyncMock()
         mock_adapter.get_current_playback = AsyncMock(return_value=None)
+        mock_adapter.get_devices.return_value = [
+            {"id": "device", "is_restricted": False}
+        ]
         mock_adapter_cls.return_value = mock_adapter
 
         async def _run():
             with (
+                patch.object(
+                    poller, "_get_current_queue_item", return_value=current_item
+                ),
                 patch.object(
                     poller,
                     "_get_session_state",
@@ -674,9 +689,9 @@ class TestAdvanceQueueOwnership:
                 await poller._advance_queue(session, room_id, host_user_id, adapter)
 
             playback_service.finish_song.assert_awaited_once_with(session.id)
-            adapter.play.assert_awaited_once_with("spotify:track:track_b")
+            adapter.play.assert_awaited_once_with("spotify:track:track_b", None)
             mock_update.assert_called_once_with(
-                session.id, "track_b", ItemStatus.PLAYING
+                session.id, "track_b", ItemStatus.PLAYING, None
             )
             mock_state.assert_awaited_once_with(room_id, "playing", "track_b")
             playback_service._broadcast_song_changed.assert_not_called()
@@ -718,9 +733,9 @@ class TestAdvanceQueueOwnership:
                 await poller._advance_queue(session, room_id, host_user_id, adapter)
 
             playback_service.finish_song.assert_not_called()
-            adapter.play.assert_awaited_once_with("spotify:track:queued_y")
+            adapter.play.assert_awaited_once_with("spotify:track:queued_y", None)
             mock_update.assert_called_once_with(
-                session.id, "queued_y", ItemStatus.PLAYING
+                session.id, "queued_y", ItemStatus.PLAYING, None
             )
             mock_state.assert_awaited_once_with(room_id, "playing", "queued_y")
             playback_service._broadcast_song_changed.assert_awaited_once_with(

@@ -162,6 +162,21 @@ def test_resume_empty_queue_reports_add_song_message(recovery_stack):
     adapter.resume.assert_not_awaited()
 
 
+def test_automatic_playback_keeps_and_updates_the_selected_device(recovery_stack):
+    """Automatically queued songs reuse the selected browser after its ID rotates."""
+    session, first, _, _, queue, _, control, adapter = recovery_stack
+    control._session_repo.update(session.id, {"current_device_id": "saved-browser"})
+    adapter.play.return_value = "recovered-browser"
+
+    async def run():
+        await queue.add_to_queue(session.id, first.id)
+        await control.start_if_idle(session.id)
+
+    anyio.run(run)
+    adapter.play.assert_awaited_once_with("spotify:track:first", "saved-browser")
+    assert session.current_device_id == "recovered-browser"
+
+
 @pytest.mark.parametrize("status", [ItemStatus.PAUSED, ItemStatus.STOPPED])
 @pytest.mark.parametrize("same_track", [False, True])
 def test_poller_leaves_stopped_or_explicitly_paused_player_idle(status, same_track):

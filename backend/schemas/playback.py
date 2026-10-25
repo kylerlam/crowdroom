@@ -34,6 +34,35 @@ class PlayRequest(BaseModel):
     )
 
 
+class SpotifyStatusResponse(BaseModel):
+    """Whether the room host has saved Spotify account authorization."""
+
+    authorized: bool
+
+
+class SpotifyDeviceResponse(BaseModel):
+    """Non-secret Spotify Connect device information for room managers."""
+
+    id: str | None = None
+    name: str
+    type: str
+    is_active: bool
+    is_restricted: bool
+
+
+class SpotifyDevicesResponse(BaseModel):
+    """Available devices and the room's preferred playback target."""
+
+    devices: list[SpotifyDeviceResponse]
+    selected_device_id: str | None = None
+
+
+class SelectSpotifyDeviceRequest(BaseModel):
+    """Select an available Spotify Connect device for this room."""
+
+    device_id: str = Field(min_length=1, max_length=255)
+
+
 class PlaybackStateResponse(BaseModel):
     """Response schema for current playback state.
 

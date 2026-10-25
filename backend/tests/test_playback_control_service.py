@@ -446,7 +446,7 @@ class TestPlaybackControlServiceSkip:
         mock_room_service.assert_manager.assert_called_once_with(room_id, user_id)
         mock_playback_service.finish_song.assert_called_once_with(session_id)
         mock_queue_service.get_current_song.assert_called_once_with(session_id)
-        mock_adapter.play.assert_called_once_with("spotify:track:next_track_id")
+        mock_adapter.play.assert_called_once_with("spotify:track:next_track_id", None)
         mock_session_repo.update.assert_called_once()
         call_args = mock_session_repo.update.call_args
         assert call_args[0][0] == session_id
