@@ -5,12 +5,14 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from backend.api.auth.dependencies import get_current_user
+from backend.api.playback.dependencies import get_playback_control_service
 from backend.api.rooms.dependencies import get_room_service
 from backend.api.session.dependencies import get_playback_service, get_session_service
 from backend.core.exceptions import EntityNotFoundException
 from backend.db.models.user import User
 from backend.schemas.playback import FinishResponse
 from backend.schemas.session import CreateSession, ReadSession, UpdateSession
+from backend.services.playback_control_service import PlaybackControlService
 from backend.services.playback_service import PlaybackService
 from backend.services.room_service import RoomService
 from backend.services.session_service import SessionService
@@ -161,6 +163,7 @@ async def finish_current_song(
     room_service: RoomService = Depends(get_room_service),
     session_service: SessionService = Depends(get_session_service),
     playback_service: PlaybackService = Depends(get_playback_service),
+    playback_control: PlaybackControlService = Depends(get_playback_control_service),
 ) -> FinishResponse:
     """Advance to the next song by finishing the current one.
 
@@ -173,6 +176,7 @@ async def finish_current_song(
         room_service: Service enforcing room management permission.
         session_service: Service locating the session's room.
         playback_service (PlaybackService): The injected playback service.
+        playback_control: Starts the next queued song after finishing this one.
 
     Returns:
         FinishResponse: Confirmation of the finished state.
@@ -180,4 +184,5 @@ async def finish_current_song(
     session = session_service.get_session(session_id)
     room_service.assert_manager(session.room_id, current_user.id)
     new_status = await playback_service.finish_song(session_id)
+    await playback_control.start_if_idle(session_id)
     return FinishResponse(status=new_status)
