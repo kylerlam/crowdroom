@@ -38,3 +38,9 @@ def limit_signup_from_source(source: str) -> None:
     """Apply both short bursts and an hourly account-creation ceiling."""
     request_limiter.check("signup-minute", source, 5, 60)
     request_limiter.check("signup-hour", source, 30, 3600)
+
+
+def limit_guest_creation_from_source(source: str) -> None:
+    """Bound new guest identities while letting people on one Wi-Fi join normally."""
+    request_limiter.check("guest-minute", source, 10, 60)
+    request_limiter.check("guest-hour", source, 60, 3600)

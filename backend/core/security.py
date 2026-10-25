@@ -53,6 +53,8 @@ class SecurityService:
             expire = datetime.now(timezone.utc) + timedelta(
                 minutes=self._access_expire_min
             )
+        elif token_type == TokenType.GUEST_IDENTITY:
+            expire = datetime.now(timezone.utc) + timedelta(days=365)
         else:
             raise ValueError(f"Unknown token type: {token_type}")
 

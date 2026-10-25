@@ -32,12 +32,12 @@ class TestAuthServiceLocalLogin:
         user_id = uuid4()
         mock_user = MagicMock()
         mock_user.id = user_id
-        mock_user.hashed_password = None
+        mock_user.hashed_password = "existing-hash"
         mock_user.token_version = 0
         mock_user_service.get_by_username.return_value = mock_user
         mock_security_service.create_token.return_value = "mock_token"
 
-        request = LocalLoginRequest(username="existinguser")
+        request = LocalLoginRequest(username="existinguser", password="secret123")
         result = auth_service.local_login(request)
 
         assert result.access_token == "mock_token"
@@ -58,7 +58,7 @@ class TestAuthServiceLocalLogin:
         mock_user_service.create_user.return_value = new_user
         mock_security_service.create_token.return_value = "new_token"
 
-        request = LocalLoginRequest(username="newuser")
+        request = LocalLoginRequest(username="newuser", password="secret123")
         result = auth_service.local_login(request)
 
         assert result.access_token == "new_token"
@@ -70,12 +70,12 @@ class TestAuthServiceLocalLogin:
     ):
         mock_user = MagicMock()
         mock_user.id = uuid4()
-        mock_user.hashed_password = None
+        mock_user.hashed_password = "existing-hash"
         mock_user.token_version = 0
         mock_user_service.get_by_username.return_value = mock_user
         mock_security_service.create_token.return_value = "tok"
 
-        request = LocalLoginRequest(username="  MyUser  ")
+        request = LocalLoginRequest(username="  MyUser  ", password="secret123")
         auth_service.local_login(request)
 
         mock_user_service.get_by_username.assert_called_once_with("myuser")
@@ -194,6 +194,10 @@ class TestAuthCookie:
             mock_auth_service = MagicMock(spec=AuthService)
             mock_auth_service.local_login.return_value = TokenResponse(
                 access_token="cookie_token_value"
+            )
+            mock_auth_service.guest_login.return_value = (
+                TokenResponse(access_token="cookie_token_value"),
+                "guest_identity_value",
             )
             app.dependency_overrides[get_auth_service] = lambda: mock_auth_service
             yield TestClient(app)

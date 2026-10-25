@@ -2,16 +2,23 @@
 
 from uuid import UUID
 
+import jwt
+
 from backend.core.exceptions import (
     EntityExistsException,
+    ForbiddenException,
     InvalidCredentialsException,
     PasswordRequiredException,
 )
-from backend.core.rate_limit import limit_signup_from_source
+from backend.core.rate_limit import (
+    limit_guest_creation_from_source,
+    limit_signup_from_source,
+)
 from backend.core.security import SecurityService
 from backend.db.models.enum import TokenType
 from backend.db.models.user import User
 from backend.schemas.auth import (
+    GuestLoginRequest,
     LocalLoginRequest,
     LoginRequest,
     RegisterRequest,
@@ -71,7 +78,7 @@ class AuthService:
 
         If a password is provided and the user doesn't exist, creates a
         password-protected account. If the user exists with a password,
-        verifies it. Passwordless users can login without a password.
+        verifies it. Nickname-only entry must use the signed guest flow.
 
         Args:
             user_data: The schema containing username and optional password.
@@ -89,6 +96,12 @@ class AuthService:
         )
         user = self._user_service.get_by_username(username)
 
+        if not plain_password:
+            if user and user.hashed_password:
+                raise PasswordRequiredException()
+            raise InvalidCredentialsException(
+                "Use the guest entry to join without a password"
+            )
         if not user:
             if source_ip is not None:
                 limit_signup_from_source(source_ip)
@@ -97,12 +110,14 @@ class AuthService:
             )
             user = self._user_service.create_user(user_to_create)
         elif user.hashed_password:
-            if not plain_password:
-                raise PasswordRequiredException()
             if not self._security_service.verify_password(
                 plain_password, user.hashed_password
             ):
                 raise InvalidCredentialsException()
+        else:
+            raise InvalidCredentialsException(
+                "Use the guest entry to restore your session"
+            )
 
         token = self._security_service.create_token(
             token_type=TokenType.ACCESS,
@@ -110,6 +125,52 @@ class AuthService:
         )
 
         return TokenResponse(access_token=token, token_type="bearer")
+
+    def guest_login(
+        self,
+        user_data: GuestLoginRequest,
+        identity_token: str | None,
+        source_ip: str,
+        *,
+        local_login: bool = False,
+    ) -> tuple[TokenResponse, str]:
+        """Resume a signed guest identity or create one without trusting a nickname."""
+        if local_login:
+            existing = self._user_service.get_by_username(user_data.username.lower())
+            if existing and existing.hashed_password:
+                raise PasswordRequiredException()
+        user = None
+        if identity_token:
+            try:
+                payload = self._security_service.decode_token(
+                    identity_token, expected_type=TokenType.GUEST_IDENTITY
+                )
+                candidate = self._user_service.get_by_id(UUID(payload["sub"]))
+                if (
+                    candidate is not None
+                    and candidate.is_guest
+                    and payload.get("ver") == candidate.token_version
+                ):
+                    user = candidate
+            except jwt.InvalidTokenError, ValueError, KeyError, TypeError:
+                # Invalid, expired or deleted identities receive a fresh limited guest.
+                pass
+        if user is None:
+            limit_guest_creation_from_source(source_ip)
+            user = self._user_service.create_guest(user_data.username)
+        elif user.guest_name != user_data.username:
+            from backend.schemas.user import UserUpdate
+
+            self._user_service.update_user(
+                user.id, UserUpdate(username=user_data.username)
+            )
+
+        claims = {"sub": str(user.id), "ver": user.token_version}
+        token = self._security_service.create_token(TokenType.ACCESS, claims)
+        guest_identity = self._security_service.create_token(
+            TokenType.GUEST_IDENTITY, claims
+        )
+        return TokenResponse(access_token=token), guest_identity
 
     def login_user(self, user_data: LoginRequest) -> TokenResponse:
         """Authenticates a user and returns a token.
@@ -126,7 +187,7 @@ class AuthService:
         identifier = user_data.identifier.strip().lower()
         user = self._user_service.get_by_identifier(identifier)
 
-        if not user:
+        if not user or user.is_guest is True or not user.hashed_password:
             raise InvalidCredentialsException()
 
         is_valid = self._security_service.verify_password(
@@ -206,6 +267,8 @@ class AuthService:
         Raises:
             EntityExistsException: If the email is already taken by another user.
         """
+        if user.is_guest is True:
+            raise ForbiddenException("Register an account to use account features")
         normalized_email = email.strip().lower()
 
         if not user.email:

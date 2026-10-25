@@ -1,6 +1,21 @@
 """Authentication schemas for the API."""
 
-from pydantic import BaseModel, EmailStr, Field, SecretStr
+from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
+
+
+class GuestLoginRequest(BaseModel):
+    """Nickname-only entry, independent of a registered account's login name."""
+
+    username: str = Field(min_length=1, max_length=32)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_nickname(cls, value: str) -> str:
+        """Reject blank or control-character nicknames at the request boundary."""
+        value = value.strip()
+        if not value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("Enter a nickname without control characters")
+        return value
 
 
 class RegisterRequest(BaseModel):
@@ -34,7 +49,7 @@ class LoginRequest(BaseModel):
     password: SecretStr = Field(..., description="The user plain text password.")
 
 
-class LocalLoginRequest(BaseModel):
+class LocalLoginRequest(GuestLoginRequest):
     """Request schema for LOCAL mode authentication.
 
     Attributes:

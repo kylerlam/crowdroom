@@ -41,7 +41,7 @@ class PlatformConnectionRepo:
     def can_manage_connection(self, user_id: UUID) -> bool:
         """Allow preauthorization or management by the current room's host."""
         user = self._session.get(User, user_id, populate_existing=True)
-        if user is None:
+        if user is None or user.is_guest:
             return False
         if user.room_id is None:
             return True

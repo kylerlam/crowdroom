@@ -1,9 +1,10 @@
 """Database model representing a User in the system."""
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import Boolean, Column, DateTime, UniqueConstraint, false
 from sqlalchemy.orm import Mapped
 from sqlmodel import Field, Relationship, SQLModel
 
@@ -49,6 +50,21 @@ class User(SQLModel, table=True):
     avatar_path: str | None = Field(default=None, max_length=255, nullable=True)
     room_id: UUID | None = Field(default=None, foreign_key="rooms.id", nullable=True)
     token_version: int = Field(default=0, nullable=False)
+    is_guest: bool = Field(
+        default=False, sa_column=Column(Boolean, nullable=False, server_default=false())
+    )
+    guest_name: str | None = Field(default=None, max_length=32, nullable=True)
+    guest_first_joined_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+    guest_last_requested_at: datetime | None = Field(
+        default=None, sa_type=DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def display_name(self) -> str:
+        """Show a guest's chosen nickname without exposing its random login handle."""
+        return self.guest_name if self.is_guest and self.guest_name else self.username
 
     # Relations
     room: "Room" = Relationship(

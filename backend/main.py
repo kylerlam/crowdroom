@@ -85,6 +85,8 @@ async def limit_signup_and_room_entry(request: Request, call_next):
             limit_signup_from_source(source)
         if path == f"{prefix}/auth/local-login":
             request_limiter.check("local-login", source, 60, 60)
+        if path == f"{prefix}/auth/guest":
+            request_limiter.check("guest-login", source, 60, 60)
         if path.startswith(f"{prefix}/rooms/") and path.endswith("/join"):
             request_limiter.check("join-source", source, 120, 60)
             token = request.cookies.get(settings.AUTH_COOKIE_NAME)

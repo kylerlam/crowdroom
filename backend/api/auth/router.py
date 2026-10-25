@@ -22,6 +22,7 @@ from PIL import Image
 from backend.api.auth.dependencies import (
     get_auth_service,
     get_current_user_unchecked,
+    get_registered_user,
     get_spotify_oauth_service,
 )
 from backend.api.users.dependencies import get_user_service
@@ -36,6 +37,7 @@ from backend.db.models.user import User
 from backend.schemas.auth import (
     ChangePasswordRequest,
     CompleteProfileRequest,
+    GuestLoginRequest,
     LocalLoginRequest,
     LoginRequest,
     RegisterRequest,
@@ -51,6 +53,7 @@ from backend.services.user_service import UserService
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
+GUEST_IDENTITY_COOKIE_NAME = "crowdroom_guest"
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
@@ -201,9 +204,9 @@ def local_login(
     response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> TokenResponse:
-    """Authenticate with username only (LOCAL mode).
+    """Authenticate a LOCAL account or securely enter as a nickname-only guest.
 
-    Finds existing user or auto-creates one. No password required.
+    Passwordless entry uses the signed guest identity rather than a nickname lookup.
     Disabled when AUTH_MODE=ONLINE.
 
     Args:
@@ -224,6 +227,16 @@ def local_login(
             detail="Endpoint not available in ONLINE mode",
         )
     try:
+        if login_request.password is None:
+            token_response, guest_identity = auth_service.guest_login(
+                GuestLoginRequest(username=login_request.username),
+                identity_token=request.cookies.get(GUEST_IDENTITY_COOKIE_NAME),
+                source_ip=request.client.host if request.client else "unknown",
+                local_login=True,
+            )
+            _set_guest_cookie(response, guest_identity)
+            _set_auth_cookie(response, token_response.access_token)
+            return token_response
         token_response = auth_service.local_login(
             login_request,
             source_ip=request.client.host if request.client else "unknown",
@@ -242,15 +255,46 @@ def local_login(
         ) from exc
 
 
+@router.post("/guest", response_model=TokenResponse)
+def guest_login(
+    body: GuestLoginRequest,
+    request: Request,
+    response: Response,
+    auth_service: AuthService = Depends(get_auth_service),
+) -> TokenResponse:
+    """Enter as a nickname-only guest or restore the same browser's guest identity."""
+    token_response, guest_identity = auth_service.guest_login(
+        body,
+        identity_token=request.cookies.get(GUEST_IDENTITY_COOKIE_NAME),
+        source_ip=request.client.host if request.client else "unknown",
+    )
+    _set_auth_cookie(response, token_response.access_token)
+    _set_guest_cookie(response, guest_identity)
+    return token_response
+
+
+def _set_guest_cookie(response: Response, guest_identity: str) -> None:
+    """Keep the browser's guest identity across logout and access-token expiry."""
+    response.set_cookie(
+        key=GUEST_IDENTITY_COOKIE_NAME,
+        value=guest_identity,
+        max_age=365 * 24 * 60 * 60,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.COOKIE_SAMESITE,
+        path="/",
+    )
+
+
 @router.post("/set-password", status_code=status.HTTP_204_NO_CONTENT)
 def set_password(
     body: SetPasswordRequest,
-    current_user: User = Depends(get_current_user_unchecked),
+    current_user: User = Depends(get_registered_user),
     auth_service: AuthService = Depends(get_auth_service),
 ) -> None:
     """Set a password on a passwordless account.
 
-    Allows guest users to upgrade their account so they can create rooms.
+    Allows legacy accounts to set a password so they can create rooms.
     Fails if the user already has a password set.
 
     Args:
@@ -313,7 +357,7 @@ def change_password(
 @router.post("/complete-profile", status_code=status.HTTP_204_NO_CONTENT)
 def complete_profile(
     body: CompleteProfileRequest,
-    current_user: User = Depends(get_current_user_unchecked),
+    current_user: User = Depends(get_registered_user),
     auth_service: AuthService = Depends(get_auth_service),
 ) -> None:
     """Complete a user's profile by setting email and password.
@@ -409,7 +453,7 @@ async def upload_avatar(
 
 @router.post("/spotify/start", response_model=SpotifyAuthorizeResponse)
 def start_spotify_oauth(
-    user: User = Depends(get_current_user_unchecked),
+    user: User = Depends(get_registered_user),
     spotify_oauth_service: SpotifyOAuthService = Depends(get_spotify_oauth_service),
 ) -> SpotifyAuthorizeResponse:
     """Build the Spotify authorization URL for the authenticated user.

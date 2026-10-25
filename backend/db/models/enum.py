@@ -30,6 +30,7 @@ class TokenType(str, Enum):
     """Represents the type of token that can be generated."""
 
     ACCESS = "access"
+    GUEST_IDENTITY = "guest_identity"
 
 
 class ConnectionType(str, Enum):

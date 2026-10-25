@@ -1,8 +1,8 @@
 """Service layer for managing user-related business logic."""
 
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from backend.core.exceptions import EntityNotFoundException
+from backend.core.exceptions import EntityNotFoundException, ForbiddenException
 from backend.core.security import SecurityService
 from backend.db.models.user import User
 from backend.repositories.user_repo import UserRepository
@@ -115,6 +115,14 @@ class UserService:
         user_model = User(**data)
         return self._user_repo.save(user_model)
 
+    def create_guest(self, nickname: str) -> User:
+        """Create an identity whose nickname cannot be used as a login credential."""
+        return self._user_repo.save(
+            User(
+                username=f"guest_{uuid4().hex[:24]}", is_guest=True, guest_name=nickname
+            )
+        )
+
     def update_user(self, user_id: UUID, user_data: UserUpdate) -> UserRead:
         """Updates an existing user's information.
 
@@ -132,6 +140,21 @@ class UserService:
         if not db_user:
             raise EntityNotFoundException("User", user_id)
         update_dict = user_data.model_dump(exclude_unset=True)
+
+        if db_user.is_guest:
+            if "email" in update_dict or "password" in update_dict:
+                raise ForbiddenException("Register an account to use account features")
+            if "username" in update_dict:
+                nickname = update_dict.pop("username")
+                if (
+                    not nickname
+                    or not nickname.strip()
+                    or any(ord(char) < 32 or ord(char) == 127 for char in nickname)
+                ):
+                    raise ForbiddenException(
+                        "Enter a nickname without control characters"
+                    )
+                update_dict["guest_name"] = nickname.strip()
 
         if "username" in update_dict:
             update_dict["username"] = update_dict["username"].lower()
@@ -157,6 +180,8 @@ class UserService:
         db_user = self._user_repo.get_by_id(user_id)
         if not db_user:
             raise EntityNotFoundException("User", user_id)
+        if db_user.is_guest:
+            raise ForbiddenException("Register an account to set a password")
         db_user.hashed_password = hashed_password
         self._user_repo.save(db_user)
 

@@ -1,8 +1,11 @@
 """User schemas for the API."""
 
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, model_validator
+
+from backend.core.guest_access import guest_request_available_at
 
 
 class UserBase(BaseModel):
@@ -90,6 +93,8 @@ class UserRead(UserBase):
     has_password: bool = Field(
         default=False, description="Whether the user has a password set."
     )
+    is_guest: bool = False
+    guest_request_available_at: datetime | None = None
     profile_complete: bool = Field(
         default=False,
         description="Whether the user has both email and password set.",
@@ -109,10 +114,12 @@ class UserRead(UserBase):
             data = {
                 "id": data.id,
                 "public_id": data.public_id,
-                "username": data.username,
+                "username": data.display_name,
                 "email": data.email,
                 "room_id": data.room_id,
                 "has_password": data.hashed_password is not None,
+                "is_guest": data.is_guest,
+                "guest_request_available_at": guest_request_available_at(data),
                 "profile_complete": (
                     data.hashed_password is not None and data.email is not None
                 ),

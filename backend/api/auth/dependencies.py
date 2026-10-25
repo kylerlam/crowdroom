@@ -8,7 +8,7 @@ from sqlmodel import Session as DBSession
 
 from backend.api.users.dependencies import get_user_service
 from backend.core.config import settings
-from backend.core.exceptions import ProfileIncompleteException
+from backend.core.exceptions import ForbiddenException, ProfileIncompleteException
 from backend.core.security import SecurityService
 from backend.db.database import get_session
 from backend.db.models.enum import TokenType
@@ -119,7 +119,7 @@ def get_current_user(
     Raises:
         ProfileIncompleteException: If ONLINE mode and profile is incomplete.
     """
-    if settings.AUTH_MODE == "ONLINE":
+    if settings.AUTH_MODE == "ONLINE" and current_user.is_guest is not True:
         missing_fields = []
         if not current_user.email:
             missing_fields.append("email")
@@ -127,6 +127,15 @@ def get_current_user(
             missing_fields.append("password")
         if missing_fields:
             raise ProfileIncompleteException(missing_fields)
+    return current_user
+
+
+def get_registered_user(
+    current_user: User = Depends(get_current_user_unchecked),
+) -> User:
+    """Keep account and connection management unavailable to explicit guests."""
+    if current_user.is_guest is True:
+        raise ForbiddenException("Register an account to use account features")
     return current_user
 
 
