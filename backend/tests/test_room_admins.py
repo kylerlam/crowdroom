@@ -14,6 +14,7 @@ from backend.repositories.room_ban_repo import RoomBanRepository
 from backend.repositories.room_repo import RoomRepository
 from backend.repositories.user_repo import UserRepository
 from backend.schemas.room import ReadRoom, RoomSettings, UpdateRoom
+from backend.services.room_membership_service import RoomMembershipService
 from backend.services.room_moderation_service import RoomModerationService
 from backend.services.room_service import RoomService
 
@@ -148,3 +149,31 @@ def test_owner_kicking_administrator_also_revokes_role(room_roles):
 
     assert admin.id not in room.admin_user_ids
     assert admin.room_id is None
+
+
+def test_leaving_room_revokes_administration(room_roles):
+    room, _host, admin, _other_admin, _member, service, _manager = room_roles
+    membership = RoomMembershipService(
+        service,
+        MagicMock(),
+        MagicMock(spec=UserRepository),
+        service._room_repo,
+        MagicMock(spec=RoomBanRepository),
+    )
+    with patch("backend.services.room_membership_service.manager") as manager:
+        manager.broadcast = AsyncMock()
+        anyio.run(membership.leave_room, admin)
+
+    assert admin.id not in room.admin_user_ids
+    assert admin.room_id is None
+
+
+def test_administrator_cannot_unban_protected_roles(room_roles):
+    room, host, admin, other_admin, _member, service, _manager = room_roles
+    moderation = RoomModerationService(
+        service, MagicMock(spec=RoomBanRepository), MagicMock(spec=UserRepository)
+    )
+
+    for protected in [host, admin, other_admin]:
+        with pytest.raises(ForbiddenException):
+            moderation.unban_user(room.id, admin.id, protected.id)

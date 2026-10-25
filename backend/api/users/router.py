@@ -4,7 +4,10 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, status
 
+from backend.api.auth.dependencies import get_current_user
 from backend.api.users.dependencies import get_user_service
+from backend.core.exceptions import ForbiddenException
+from backend.db.models.user import User
 from backend.schemas.user import UserCreate, UserRead, UserUpdate
 from backend.services.user_service import UserService
 
@@ -47,6 +50,7 @@ async def create_user(
 async def update_user(
     user_id: UUID,
     user_data: UserUpdate,
+    current_user: User = Depends(get_current_user),
     user_service: UserService = Depends(get_user_service),
 ) -> UserRead:
     """Updates an existing user's information.
@@ -54,23 +58,30 @@ async def update_user(
     Args:
         user_id (UUID): The unique identifier of the user to update.
         user_data (UserUpdate): The schema containing the fields to update.
+        current_user: The authenticated account owner.
         user_service (UserService): The injected user service.
 
     Returns:
         UserRead: The updated user schema.
     """
+    if current_user.id != user_id:
+        raise ForbiddenException("You can only update your own account")
     return user_service.update_user(user_id, user_data)
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(
     user_id: UUID,
+    current_user: User = Depends(get_current_user),
     user_service: UserService = Depends(get_user_service),
 ) -> None:
     """Deletes a user from the system.
 
     Args:
         user_id (UUID): The unique identifier of the user to delete.
+        current_user: The authenticated account owner.
         user_service (UserService): The injected user service.
     """
+    if current_user.id != user_id:
+        raise ForbiddenException("You can only delete your own account")
     user_service.delete_user(user_id)
