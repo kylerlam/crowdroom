@@ -9,6 +9,7 @@ from backend.api.users.dependencies import get_user_repo
 from backend.core.config import settings
 from backend.core.security import SecurityService
 from backend.db.database import get_session
+from backend.repositories.room_admission_repo import RoomAdmissionRepository
 from backend.repositories.room_ban_repo import RoomBanRepository
 from backend.repositories.room_invite_repo import RoomInviteRepository
 from backend.repositories.room_repo import RoomRepository
@@ -90,9 +91,14 @@ def get_room_membership_service(
         A RoomMembershipService instance for join/leave operations.
     """
     invite_repo = RoomInviteRepository(session)
-    invite_service = RoomInviteService(invite_repo, room_repo, user_repo, room_service)
+    invite_service = RoomInviteService(invite_repo, room_repo, room_service)
     return RoomMembershipService(
-        room_service, invite_service, user_repo, room_repo, ban_repo
+        room_service,
+        invite_service,
+        user_repo,
+        room_repo,
+        ban_repo,
+        RoomAdmissionRepository(session),
     )
 
 

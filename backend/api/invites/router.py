@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 
 from backend.api.auth.dependencies import get_current_user
 from backend.api.invites.dependencies import get_invite_qr_service, get_invite_service
+from backend.api.rooms.dependencies import get_room_membership_service
 from backend.core.exceptions import (
     DeviceUnreachableException,
     EntityNotFoundException,
@@ -23,6 +24,7 @@ from backend.schemas.room_invite import (
 )
 from backend.services.invite_qr_service import InviteQRService
 from backend.services.room_invite_service import RoomInviteService
+from backend.services.room_membership_service import RoomMembershipService
 
 router = APIRouter(prefix="/rooms", tags=["invites"])
 
@@ -93,10 +95,13 @@ async def join_via_invite(
     token: str,
     current_user: User = Depends(get_current_user),
     invite_service: RoomInviteService = Depends(get_invite_service),
+    membership_service: RoomMembershipService = Depends(get_room_membership_service),
 ) -> InviteJoinResult:
     """Join a room using an invite token, bypassing PIN check."""
     try:
-        return invite_service.join_via_invite(token, current_user)
+        return await invite_service.join_via_invite(
+            token, current_user, membership_service
+        )
     except InviteExpiredException as exc:
         raise HTTPException(status_code=410, detail=str(exc)) from exc
     except EntityNotFoundException as exc:

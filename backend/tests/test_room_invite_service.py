@@ -2,9 +2,10 @@
 
 # ruff: noqa: D101, D102
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
+import anyio
 import pytest
 from sqlalchemy.exc import IntegrityError
 
@@ -19,8 +20,7 @@ from backend.db.models.room_invite import RoomInvite
 from backend.db.models.user import User
 from backend.repositories.room_invite_repo import RoomInviteRepository
 from backend.repositories.room_repo import RoomRepository
-from backend.repositories.user_repo import UserRepository
-from backend.schemas.room_invite import CreateRoomInvite
+from backend.schemas.room_invite import CreateRoomInvite, InviteJoinResult
 from backend.services.room_invite_service import MAX_TOKEN_RETRIES, RoomInviteService
 from backend.services.room_service import RoomService
 
@@ -35,19 +35,15 @@ class TestRoomInviteService:
         return MagicMock(spec=RoomRepository)
 
     @pytest.fixture
-    def mock_user_repo(self):
-        return MagicMock(spec=UserRepository)
-
-    @pytest.fixture
     def mock_room_service(self):
         return MagicMock(spec=RoomService)
 
     @pytest.fixture
     def invite_service(
-        self, mock_invite_repo, mock_room_repo, mock_user_repo, mock_room_service
+        self, mock_invite_repo, mock_room_repo, mock_room_service
     ):
         return RoomInviteService(
-            mock_invite_repo, mock_room_repo, mock_user_repo, mock_room_service
+            mock_invite_repo, mock_room_repo, mock_room_service
         )
 
     @pytest.fixture
@@ -205,7 +201,7 @@ class TestRoomInviteService:
     # --- join_via_invite ---
 
     def test_join_via_invite_success(
-        self, invite_service, mock_invite_repo, mock_room_repo, mock_user_repo, room
+        self, invite_service, mock_invite_repo, mock_room_repo, room
     ):
         invite = MagicMock(spec=RoomInvite)
         invite.room_id = room.id
@@ -217,49 +213,62 @@ class TestRoomInviteService:
 
         user = MagicMock(spec=User)
         user.room_id = None
-        mock_user_repo.save.return_value = user
 
-        result = invite_service.join_via_invite("validtoken00", user)
+        membership = MagicMock()
+        membership.join_room = AsyncMock(
+            return_value=InviteJoinResult(
+                room_id=room.id,
+                room_name=room.room_name,
+                status="pending",
+                message="Approval required",
+            )
+        )
+        result = anyio.run(
+            invite_service.join_via_invite, "validtoken00", user, membership
+        )
 
         assert result.room_id == room.id
         assert result.room_name == room.room_name
-        assert user.room_id == room.id
-        mock_user_repo.save.assert_called_once_with(user)
-        mock_invite_repo.increment_use_count.assert_called_once_with(invite)
+        assert result.status == "pending"
+        assert user.room_id is None
+        mock_invite_repo.increment_use_count.assert_not_called()
+        membership.join_room.assert_awaited_once_with(
+            room.id, user, invite_token="validtoken00"
+        )
 
     def test_join_via_invite_expired(self, invite_service, mock_invite_repo):
         invite = MagicMock(spec=RoomInvite)
         invite.expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
         invite.max_uses = None
         invite.use_count = 0
+        invite.room_id = uuid4()
         mock_invite_repo.get_by_token.return_value = invite
 
-        user = MagicMock(spec=User)
-
         with pytest.raises(InviteExpiredException):
-            invite_service.join_via_invite("expiredtoken", user)
+            invite_service.get_valid_invite("expiredtoken", invite.room_id)
 
     def test_join_via_invite_exhausted(self, invite_service, mock_invite_repo):
         invite = MagicMock(spec=RoomInvite)
         invite.expires_at = None
         invite.max_uses = 3
         invite.use_count = 3
+        invite.room_id = uuid4()
         mock_invite_repo.get_by_token.return_value = invite
 
-        user = MagicMock(spec=User)
-
         with pytest.raises(InviteExpiredException):
-            invite_service.join_via_invite("useduptoken0", user)
+            invite_service.get_valid_invite("useduptoken0", invite.room_id)
 
     def test_join_via_invite_not_found(self, invite_service, mock_invite_repo):
         mock_invite_repo.get_by_token.return_value = None
         user = MagicMock(spec=User)
 
         with pytest.raises(EntityNotFoundException):
-            invite_service.join_via_invite("nonexistent0", user)
+            anyio.run(
+                invite_service.join_via_invite, "nonexistent0", user, MagicMock()
+            )
 
     def test_join_via_invite_user_already_in_room(
-        self, invite_service, mock_invite_repo, mock_room_repo, mock_user_repo, room
+        self, invite_service, mock_invite_repo, mock_room_repo, room
     ):
         invite = MagicMock(spec=RoomInvite)
         invite.room_id = room.id
@@ -271,10 +280,13 @@ class TestRoomInviteService:
 
         user = MagicMock(spec=User)
         user.room_id = uuid4()  # already in another room
-        mock_user_repo.save.return_value = user
 
+        membership = MagicMock()
+        membership.join_room = AsyncMock(side_effect=UserAlreadyInRoomException())
         with pytest.raises(UserAlreadyInRoomException):
-            invite_service.join_via_invite("validtoken00", user)
+            anyio.run(
+                invite_service.join_via_invite, "validtoken00", user, membership
+            )
 
     # --- list_invites ---
 

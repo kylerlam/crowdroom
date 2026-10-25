@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from backend.db.models.queue_item import QueueItem
     from backend.db.models.queue_vote import QueueVote
     from backend.db.models.room import Room
+    from backend.db.models.room_admission import RoomAdmission
 
 
 class User(SQLModel, table=True):
@@ -50,4 +51,8 @@ class User(SQLModel, table=True):
     user_votes: Mapped[list["QueueVote"]] = Relationship(back_populates="user")
     platform_connections: Mapped[list["PlatformConnection"]] = Relationship(
         back_populates="user"
+    )
+    room_admissions: Mapped[list["RoomAdmission"]] = Relationship(
+        back_populates="user",
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )

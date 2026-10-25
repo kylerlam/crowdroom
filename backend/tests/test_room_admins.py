@@ -159,6 +159,7 @@ def test_leaving_room_revokes_administration(room_roles):
         MagicMock(spec=UserRepository),
         service._room_repo,
         MagicMock(spec=RoomBanRepository),
+        MagicMock(),
     )
     with patch("backend.services.room_membership_service.manager") as manager:
         manager.broadcast = AsyncMock()

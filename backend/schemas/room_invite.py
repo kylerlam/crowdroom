@@ -5,6 +5,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from backend.schemas.room import RoomJoinResult
+
 
 class CreateRoomInvite(BaseModel):
     """Input schema for creating a room invite."""
@@ -45,8 +47,4 @@ class InvitePreview(BaseModel):
     host_user_id: UUID
 
 
-class InviteJoinResult(BaseModel):
-    """Result of successfully joining a room via invite."""
-
-    room_id: UUID
-    room_name: str
+InviteJoinResult = RoomJoinResult

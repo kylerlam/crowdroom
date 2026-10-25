@@ -35,16 +35,17 @@ class UserRepository:
         """
         return list(self._db_session.exec(select(User)).all())
 
-    def get_by_id(self, user_id: UUID) -> User | None:
+    def get_by_id(self, user_id: UUID, *, fresh: bool = False) -> User | None:
         """Retrieves a user by their unique ID.
 
         Args:
             user_id (UUID): The ID of the user to retrieve.
+            fresh: Reload membership changed by another join request.
 
         Returns:
             User | None: The User object if found, otherwise None.
         """
-        return self._db_session.get(User, user_id)
+        return self._db_session.get(User, user_id, populate_existing=fresh)
 
     def get_by_email(self, email: str) -> User | None:
         """Retrieves a user by their email address.

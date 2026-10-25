@@ -2,7 +2,7 @@
 
 import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -155,6 +155,37 @@ class JoinRoom(BaseModel):
 
     pin: str | None = Field(None, description="Pin of the room.")
     invite_token: str | None = Field(None, description="Invite token for the room.")
+
+
+class RoomJoinResult(BaseModel):
+    """A completed join or a persistent first-entry approval request."""
+
+    room_id: UUID
+    room_name: str
+    status: Literal["joined", "pending", "rejected"]
+    message: str
+
+
+class RoomAdmissionStatus(BaseModel):
+    """The authenticated user's admission state for a room."""
+
+    room_id: UUID
+    user_id: UUID
+    status: Literal["none", "pending", "approved", "rejected"]
+
+
+class RoomAdmissionRequest(BaseModel):
+    """An account awaiting approval or declined, available for manager review."""
+
+    user_id: UUID
+    username: str
+    status: Literal["pending", "rejected"]
+
+
+class UpdateRoomAdmission(BaseModel):
+    """A manager's approval or rejection of a waiting account."""
+
+    approved: bool
 
 
 class UpdateRoomAdmin(BaseModel):

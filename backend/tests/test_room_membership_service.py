@@ -16,6 +16,7 @@ from backend.core.exceptions import (
 )
 from backend.db.models.room import Room
 from backend.db.models.user import User
+from backend.repositories.room_admission_repo import RoomAdmissionRepository
 from backend.repositories.room_ban_repo import RoomBanRepository
 from backend.repositories.room_repo import RoomRepository
 from backend.repositories.user_repo import UserRepository
@@ -32,6 +33,14 @@ def _reset_pin_cooldowns():
     _pin_attempt_cooldowns.clear()
     yield
     _pin_attempt_cooldowns.clear()
+
+
+@pytest.fixture
+def approved_admissions():
+    """Existing access-control cases use an account already approved once."""
+    repo = MagicMock(spec=RoomAdmissionRepository)
+    repo.get.return_value.status = "approved"
+    return repo
 
 
 class TestJoinRoom:
@@ -67,13 +76,17 @@ class TestJoinRoom:
         mock_user_repo,
         mock_room_repo,
         mock_ban_repo,
+        approved_admissions,
+        user,
     ):
+        mock_user_repo.get_by_id.return_value = user
         return RoomMembershipService(
             mock_room_service,
             mock_invite_service,
             mock_user_repo,
             mock_room_repo,
             mock_ban_repo,
+            approved_admissions,
         )
 
     @pytest.fixture
@@ -165,7 +178,6 @@ class TestJoinRoom:
         private_room,
     ):
         mock_room_service.get_room.return_value = private_room
-        mock_invite_service.validate_and_consume_invite.return_value = False
         mock_room_service.verify_pin.return_value = True
         mock_broadcast = AsyncMock()
 
@@ -191,7 +203,6 @@ class TestJoinRoom:
         private_room,
     ):
         mock_room_service.get_room.return_value = private_room
-        mock_invite_service.validate_and_consume_invite.return_value = True
         mock_broadcast = AsyncMock()
 
         async def _run():
@@ -206,8 +217,11 @@ class TestJoinRoom:
         anyio.run(_run)
 
         assert user.room_id == private_room.id
-        mock_invite_service.validate_and_consume_invite.assert_called_once_with(
+        mock_invite_service.get_valid_invite.assert_called_once_with(
             "abc123token", private_room.id
+        )
+        mock_invite_service.consume_invite.assert_called_once_with(
+            mock_invite_service.get_valid_invite.return_value
         )
 
     def test_join_private_room_no_credentials_forbidden(
@@ -219,7 +233,6 @@ class TestJoinRoom:
         private_room,
     ):
         mock_room_service.get_room.return_value = private_room
-        mock_invite_service.validate_and_consume_invite.return_value = False
 
         async def _run():
             with patch(
@@ -257,7 +270,7 @@ class TestJoinRoom:
 
         assert user.room_id == private_room.id
         mock_user_repo.save.assert_called_once_with(user)
-        mock_invite_service.validate_and_consume_invite.assert_not_called()
+        mock_invite_service.get_valid_invite.assert_not_called()
 
     def test_join_private_room_wrong_pin_forbidden(
         self,
@@ -268,7 +281,6 @@ class TestJoinRoom:
         private_room,
     ):
         mock_room_service.get_room.return_value = private_room
-        mock_invite_service.validate_and_consume_invite.return_value = False
         mock_room_service.verify_pin.return_value = False
 
         async def _run():
@@ -301,6 +313,7 @@ class TestJoinRoom:
         public_room,
     ):
         user.room_id = public_room.id
+        mock_room_service.get_room.return_value = public_room
 
         async def _run():
             with patch(
@@ -311,7 +324,7 @@ class TestJoinRoom:
 
         anyio.run(_run)
 
-        mock_room_service.get_room.assert_not_called()
+        mock_room_service.get_room.assert_called_once_with(public_room.id)
         mock_user_repo.save.assert_not_called()
 
     def test_join_room_not_found(self, membership_service, mock_room_service, user):
@@ -360,6 +373,7 @@ class TestLeaveRoom:
         mock_user_repo,
         mock_room_repo,
         mock_ban_repo,
+        approved_admissions,
     ):
         return RoomMembershipService(
             mock_room_service,
@@ -367,6 +381,7 @@ class TestLeaveRoom:
             mock_user_repo,
             mock_room_repo,
             mock_ban_repo,
+            approved_admissions,
         )
 
     @pytest.fixture
@@ -497,7 +512,6 @@ class TestPinCooldown:
     @pytest.fixture
     def mock_invite_service(self):
         mock = MagicMock(spec=RoomInviteService)
-        mock.validate_and_consume_invite.return_value = False
         return mock
 
     @pytest.fixture
@@ -524,13 +538,17 @@ class TestPinCooldown:
         mock_user_repo,
         mock_room_repo,
         mock_ban_repo,
+        approved_admissions,
+        user,
     ):
+        mock_user_repo.get_by_id.return_value = user
         return RoomMembershipService(
             mock_room_service,
             mock_invite_service,
             mock_user_repo,
             mock_room_repo,
             mock_ban_repo,
+            approved_admissions,
         )
 
     @pytest.fixture
@@ -547,6 +565,7 @@ class TestPinCooldown:
         mock_room.id = uuid4()
         mock_room.host_user_id = uuid4()
         mock_room.is_private = True
+        mock_room.room_name = "Private Room"
         mock_room.settings = {"skip_threshold": 2, "max_members": 50}
         return mock_room
 
@@ -658,7 +677,6 @@ class TestPinCooldown:
         private_room,
     ):
         mock_room_service.get_room.return_value = private_room
-        mock_invite_service.validate_and_consume_invite.return_value = True
         _pin_attempt_cooldowns[user.id] = -10.0
 
         async def _run():

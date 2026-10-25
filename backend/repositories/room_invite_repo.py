@@ -61,7 +61,11 @@ class RoomInviteRepository:
         Returns:
             The RoomInvite if found, None otherwise.
         """
-        statement = select(RoomInvite).where(RoomInvite.token == token)
+        statement = (
+            select(RoomInvite)
+            .where(RoomInvite.token == token)
+            .execution_options(populate_existing=True)
+        )
         return self._session.exec(statement).first()
 
     def get_by_room(self, room_id: UUID) -> list[RoomInvite]:

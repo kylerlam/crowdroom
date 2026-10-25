@@ -28,8 +28,12 @@ from backend.schemas.room import (
     CreateRoom,
     JoinRoom,
     ReadRoom,
+    RoomAdmissionRequest,
+    RoomAdmissionStatus,
+    RoomJoinResult,
     UpdateRoom,
     UpdateRoomAdmin,
+    UpdateRoomAdmission,
 )
 from backend.schemas.user import UserRead
 from backend.services.room_membership_service import RoomMembershipService
@@ -236,14 +240,16 @@ async def get_room_history(
     return [ReadQueueHistory.model_validate(entry) for entry in history_entries]
 
 
-@router.post("/{room_id}/join", status_code=status.HTTP_200_OK)
+@router.post(
+    "/{room_id}/join", response_model=RoomJoinResult, status_code=status.HTTP_200_OK
+)
 async def join_room(
     room_id: UUID,
     body: JoinRoom,
     current_user: User = Depends(get_current_user),
     membership_service: RoomMembershipService = Depends(get_room_membership_service),
-) -> dict:
-    """Join a room. Public rooms join directly; private rooms need PIN or invite.
+) -> RoomJoinResult:
+    """Join an approved account, or request approval after validating access.
 
     Args:
         room_id: The room to join.
@@ -255,19 +261,52 @@ async def join_room(
         Confirmation with room details.
     """
     try:
-        await membership_service.join_room(
+        return await membership_service.join_room(
             room_id,
             current_user,
             pin=body.pin,
             invite_token=body.invite_token,
         )
-        return {"room_id": str(room_id), "message": "Joined room successfully"}
     except UserAlreadyInRoomException as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ForbiddenException as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except EntityNotFoundException as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.get("/{room_id}/admission/status", response_model=RoomAdmissionStatus)
+def get_admission_status(
+    room_id: UUID,
+    current_user: User = Depends(get_current_user),
+    membership_service: RoomMembershipService = Depends(get_room_membership_service),
+) -> RoomAdmissionStatus:
+    """Poll the caller's request without creating one or consuming an invite."""
+    return membership_service.get_admission_status(room_id, current_user)
+
+
+@router.get("/{room_id}/admissions", response_model=list[RoomAdmissionRequest])
+def get_admissions(
+    room_id: UUID,
+    current_user: User = Depends(get_current_user),
+    membership_service: RoomMembershipService = Depends(get_room_membership_service),
+) -> list[RoomAdmissionRequest]:
+    """List waiting and declined first-entry requests for room managers."""
+    return membership_service.list_admissions(room_id, current_user.id)
+
+
+@router.patch("/{room_id}/admissions/{user_id}", response_model=RoomAdmissionStatus)
+async def review_admission(
+    room_id: UUID,
+    user_id: UUID,
+    body: UpdateRoomAdmission,
+    current_user: User = Depends(get_current_user),
+    membership_service: RoomMembershipService = Depends(get_room_membership_service),
+) -> RoomAdmissionStatus:
+    """Approve or reject an account; the applicant must retry their own join."""
+    return await membership_service.review_admission(
+        room_id, current_user.id, user_id, body.approved
+    )
 
 
 @router.post("/{room_id}/leave", status_code=status.HTTP_200_OK)

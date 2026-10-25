@@ -1,7 +1,7 @@
 """Service for managing room invite links."""
 
 from datetime import datetime, timedelta, timezone
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -10,20 +10,21 @@ from backend.core.exceptions import (
     EntityNotFoundException,
     ForbiddenException,
     InviteExpiredException,
-    UserAlreadyInRoomException,
 )
 from backend.core.invite_token import generate_invite_token
 from backend.db.models.room_invite import RoomInvite
 from backend.db.models.user import User
 from backend.repositories.room_invite_repo import RoomInviteRepository
 from backend.repositories.room_repo import RoomRepository
-from backend.repositories.user_repo import UserRepository
 from backend.schemas.room_invite import (
     CreateRoomInvite,
     InviteJoinResult,
     InvitePreview,
 )
 from backend.services.room_service import RoomService
+
+if TYPE_CHECKING:
+    from backend.services.room_membership_service import RoomMembershipService
 
 MAX_TOKEN_RETRIES = 5
 
@@ -35,7 +36,6 @@ class RoomInviteService:
         self,
         invite_repo: RoomInviteRepository,
         room_repo: RoomRepository,
-        user_repo: UserRepository,
         room_service: RoomService,
     ) -> None:
         """Initialize the RoomInviteService with its dependencies.
@@ -43,12 +43,10 @@ class RoomInviteService:
         Args:
             invite_repo: Repository for invite data operations.
             room_repo: Repository for room lookups.
-            user_repo: Repository for user updates on join.
             room_service: Service for room operations including host verification.
         """
         self._invite_repo = invite_repo
         self._room_repo = room_repo
-        self._user_repo = user_repo
         self._room_service = room_service
 
     def _validate_invite(self, invite: RoomInvite) -> None:
@@ -144,12 +142,15 @@ class RoomInviteService:
             host_user_id=room.host_user_id,
         )
 
-    def join_via_invite(self, token: str, user: User) -> InviteJoinResult:
-        """Join a room using an invite token, bypassing PIN check.
+    async def join_via_invite(
+        self, token: str, user: User, membership_service: "RoomMembershipService"
+    ) -> InviteJoinResult:
+        """Apply the same ban, capacity, and approval checks as ordinary joins.
 
         Args:
             token: The invite token to redeem.
             user: The authenticated user joining the room.
+            membership_service: Shared room-entry policy, supplied without a DI cycle.
 
         Returns:
             Result containing the joined room info.
@@ -161,19 +162,9 @@ class RoomInviteService:
         invite = self._invite_repo.get_by_token(token)
         if not invite:
             raise EntityNotFoundException("Invite", token)
-        self._validate_invite(invite)
-
-        room = self._room_repo.get_by_id(invite.room_id)
-        if not room:
-            raise EntityNotFoundException("Room", invite.room_id)
-
-        if user.room_id is not None and user.room_id != room.id:
-            raise UserAlreadyInRoomException(user.room_id)
-        user.room_id = room.id
-        self._user_repo.save(user)
-        self._invite_repo.increment_use_count(invite)
-
-        return InviteJoinResult(room_id=room.id, room_name=room.room_name)
+        return await membership_service.join_room(
+            invite.room_id, user, invite_token=token
+        )
 
     def list_invites(self, room_id: UUID, user_id: UUID) -> list[RoomInvite]:
         """List all invites for a room (host only).
@@ -215,22 +206,22 @@ class RoomInviteService:
 
         self._invite_repo.delete(invite_id)
 
-    def validate_and_consume_invite(self, token: str, expected_room_id: UUID) -> bool:
-        """Validate invite token for a specific room and increment use count.
+    def get_valid_invite(self, token: str, expected_room_id: UUID) -> RoomInvite:
+        """Validate an invitation without spending a use on a pending applicant.
 
         Args:
             token: The invite token to check.
             expected_room_id: The room the invite must belong to.
 
         Returns:
-            True if invite is valid for given room, False otherwise.
+            The invitation, to consume only after an approved account joins.
         """
         invite = self._invite_repo.get_by_token(token)
         if not invite or invite.room_id != expected_room_id:
-            return False
-        try:
-            self._validate_invite(invite)
-            self._invite_repo.increment_use_count(invite)
-            return True
-        except InviteExpiredException:
-            return False
+            raise EntityNotFoundException("Invite")
+        self._validate_invite(invite)
+        return invite
+
+    def consume_invite(self, invite: RoomInvite) -> None:
+        """Count an actual approved join, serialized by the room-entry lock."""
+        self._invite_repo.increment_use_count(invite)

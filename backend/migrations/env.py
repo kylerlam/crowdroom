@@ -15,6 +15,7 @@ from backend.db.models import (  # noqa: F401
     QueueItem,
     QueueVote,
     Room,
+    RoomAdmission,
     RoomBan,
     Session,
     Song,
