@@ -6,6 +6,7 @@ import time
 from typing import Any
 from uuid import UUID
 
+import anyio
 from fastapi import (
     APIRouter,
     Depends,
@@ -87,9 +88,7 @@ class ConnectionManager:
         self._last_pong: dict[WebSocket, float] = {}
         self._socket_user: dict[WebSocket, UUID] = {}
 
-    async def connect(
-        self, websocket: WebSocket, room_id: str, user_id: UUID
-    ) -> None:
+    async def connect(self, websocket: WebSocket, room_id: str, user_id: UUID) -> None:
         """Accept and register a new WebSocket connection for a room.
 
         Args:
@@ -266,9 +265,10 @@ async def websocket_endpoint(
     """
     await manager.connect(websocket, room_id, user.id)
     try:
-        async with asyncio.TaskGroup() as task_group:
-            task_group.create_task(_receive_loop(websocket, room_id))
-            task_group.create_task(_heartbeat_loop(websocket, room_id))
+        async with anyio.create_task_group() as task_group:
+            task_group.start_soon(_receive_loop, websocket, room_id)
+            await _heartbeat_loop(websocket, room_id)
+            task_group.cancel_scope.cancel()
     except* WebSocketDisconnect:
         pass
     finally:

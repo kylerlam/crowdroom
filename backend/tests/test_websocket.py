@@ -279,3 +279,60 @@ class TestWebSocketMultiClient:
 
                 data_b = websocket_b.receive_json()
                 assert data_b["type"] == "sentinel"
+
+
+def test_heartbeat_timeout_cancels_receiver_and_cleans_up():
+    """A timed-out socket must not wait forever for a client disconnect."""
+    from unittest.mock import AsyncMock, patch
+
+    from backend.api.websocket import websocket_endpoint
+
+    room_id = str(uuid4())
+    member = _make_member(room_id)
+    websocket = AsyncMock(spec=WebSocket)
+    websocket.receive_text.side_effect = anyio.sleep_forever
+
+    async def run():
+        with (
+            patch.object(settings, "WS_HEARTBEAT_INTERVAL_SECONDS", 0),
+            patch.object(manager, "is_stale", return_value=True),
+            anyio.fail_after(1),
+        ):
+            await websocket_endpoint(websocket, room_id, member)
+
+    anyio.run(run)
+    websocket.close.assert_awaited_once_with(code=1008, reason="heartbeat timeout")
+    assert room_id not in manager.active_connections
+    assert websocket not in manager._last_pong
+    assert websocket not in manager._socket_user
+
+
+def test_external_endpoint_cancellation_propagates_and_cleans_up():
+    """Cancellation from the server remains visible after socket cleanup."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from backend.api.websocket import websocket_endpoint
+
+    room_id = str(uuid4())
+    member = _make_member(room_id)
+    websocket = AsyncMock(spec=WebSocket)
+
+    async def run():
+        receiving = anyio.Event()
+
+        async def receive_forever():
+            receiving.set()
+            await anyio.sleep_forever()
+
+        websocket.receive_text.side_effect = receive_forever
+        task = asyncio.create_task(websocket_endpoint(websocket, room_id, member))
+        await receiving.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    anyio.run(run)
+    assert room_id not in manager.active_connections
+    assert websocket not in manager._last_pong
+    assert websocket not in manager._socket_user
