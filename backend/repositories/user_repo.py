@@ -2,11 +2,12 @@
 
 from uuid import UUID
 
-from sqlalchemy import func
+from sqlalchemy import func, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session as DBSession
 from sqlmodel import or_, select
 
+from backend.core.user_identity import generate_public_id
 from backend.db.models.user import User
 
 
@@ -130,14 +131,26 @@ class UserRepository:
             IntegrityError: If a unique constraint is violated
                 (duplicate email/username).
         """
-        try:
-            self._db_session.add(user)
-            self._db_session.commit()
-            self._db_session.refresh(user)
-            return user
-        except IntegrityError:
-            self._db_session.rollback()
-            raise
+        state = inspect(user)
+        new_user = state.transient or state.pending
+        for attempt in range(10):
+            try:
+                self._db_session.add(user)
+                self._db_session.commit()
+                self._db_session.refresh(user)
+                return user
+            except IntegrityError as error:
+                self._db_session.rollback()
+                constraint = getattr(
+                    getattr(error.orig, "diag", None), "constraint_name", None
+                )
+                public_id_collision = (
+                    constraint == "uq_users_public_id"
+                    or str(error.orig) == "UNIQUE constraint failed: users.public_id"
+                )
+                if not new_user or not public_id_collision or attempt == 9:
+                    raise
+                user.public_id = generate_public_id()
 
     def delete(self, user: User) -> None:
         """Deletes a user entity from the database.

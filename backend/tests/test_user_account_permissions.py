@@ -57,7 +57,9 @@ def test_account_owner_can_update_self(account_api):
     app, client, service = account_api
     user = User(username="owner")
     app.dependency_overrides[get_current_user] = lambda: user
-    service.update_user.return_value = UserRead(id=user.id, username="updated")
+    service.update_user.return_value = UserRead(
+        id=user.id, public_id=user.public_id, username="updated"
+    )
     response = client.patch(f"/users/{user.id}", json={"username": "updated"})
     assert response.status_code == 200
     assert response.json()["username"] == "updated"

@@ -3,8 +3,11 @@
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
+from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import Mapped
 from sqlmodel import Field, Relationship, SQLModel
+
+from backend.core.user_identity import generate_public_id
 
 if TYPE_CHECKING:
     from backend.db.models.platform_connection import PlatformConnection
@@ -23,6 +26,7 @@ class User(SQLModel, table=True):
 
     Attributes:
         id (UUID): Primary key, universally unique identifier.
+        public_id (str): Permanent public identifier for room admission checks.
         username (str): Unique handle for the user (max 32 chars).
         email (str, optional): Email address for authentication.
         hashed_password (str, optional): Argon2/Bcrypt hashed password.
@@ -33,8 +37,12 @@ class User(SQLModel, table=True):
     """
 
     __tablename__ = "users"
+    __table_args__ = (UniqueConstraint("public_id", name="uq_users_public_id"),)
 
     id: UUID = Field(default_factory=uuid4, primary_key=True)
+    public_id: str = Field(
+        default_factory=generate_public_id, min_length=12, max_length=12, nullable=False
+    )
     username: str = Field(max_length=32, unique=True, nullable=False)
     email: str | None = Field(default=None, max_length=255, unique=True, nullable=True)
     hashed_password: str | None = Field(default=None, max_length=255, nullable=True)

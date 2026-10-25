@@ -69,6 +69,7 @@ class UserRead(UserBase):
 
     Attributes:
         id (UUID): The unique identifier of the user.
+        public_id (str): Permanent account ID shown during room verification.
         username (str): The unique username for the user.
         email (EmailStr | None): The user's email address.
         room_id (UUID | None): The room the user is currently in.
@@ -78,6 +79,10 @@ class UserRead(UserBase):
     model_config = ConfigDict(from_attributes=True)
     id: UUID = Field(
         description="The unique identifier of the user.",
+    )
+    public_id: str = Field(
+        pattern=r"^CR-[0-9]{4}-[0-9]{4}$",
+        description="The permanent public CrowdRoom ID of this account.",
     )
     room_id: UUID | None = Field(
         default=None, description="The room the user is currently in."
@@ -103,6 +108,7 @@ class UserRead(UserBase):
             )
             data = {
                 "id": data.id,
+                "public_id": data.public_id,
                 "username": data.username,
                 "email": data.email,
                 "room_id": data.room_id,
