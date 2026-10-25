@@ -237,14 +237,17 @@ class TooManyRequestsException(AppException):
         retry_after (float): Seconds the client should wait before retrying.
     """
 
-    def __init__(self, retry_after: float = 1.0):
+    def __init__(self, retry_after: float = 1.0, message: str | None = None):
         """Initializes the exception.
 
         Args:
             retry_after: How many seconds until the action is allowed again.
+            message: Optional explanation of the specific request limit.
         """
         self.retry_after = retry_after
-        super().__init__(f"Too many requests. Try again in {retry_after:.1f}s.")
+        super().__init__(
+            message or f"Too many requests. Try again in {retry_after:.1f}s."
+        )
 
 
 class SpotifyUpstreamException(AppException):

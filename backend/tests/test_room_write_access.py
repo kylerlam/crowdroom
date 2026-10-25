@@ -1,5 +1,6 @@
 """Room membership and bans protect queue writes, including direct API calls."""
 
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -117,3 +118,29 @@ def test_admitted_member_can_add_and_vote(room_api):
     assert added.status_code == 201
     voted = client.post("/api/v1/queue/vote", json={"queue_item_id": str(item.id)})
     assert voted.status_code == 201
+
+
+def test_guest_deadline_returns_retry_after_without_sharing_ip_quota(room_api):
+    """Early requests fail; guests on the same source keep separate quotas."""
+    client, db, actor, room, session, song, _item, member, outsider = room_api
+    member.is_guest = outsider.is_guest = True
+    member.guest_first_joined_at = datetime.now(timezone.utc)
+    outsider.guest_first_joined_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+    outsider.room_id = room.id
+    db.add_all([member, outsider])
+    db.commit()
+    body = {"session_id": str(session.id), "song_id": str(song.id)}
+    actor["user"] = member
+    denied = client.post("/api/v1/queue/", json=body)
+    assert denied.status_code == 429
+    assert 290 < denied.json()["retry_after"] <= 300
+    assert int(denied.headers["Retry-After"]) > 0
+    assert db.get(User, member.id).guest_last_requested_at is None
+    actor["user"] = outsider
+    assert client.post("/api/v1/queue/", json=body).status_code == 201
+    assert (
+        client.post("/api/v1/queue/", json={**body, "group": "playlist"}).status_code
+        == 429
+    )
+    actor["user"] = member
+    assert client.post("/api/v1/queue/", json=body).status_code == 429

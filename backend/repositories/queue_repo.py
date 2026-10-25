@@ -1,5 +1,6 @@
 """Repository for QueueItem data access."""
 
+from datetime import datetime, timezone
 from uuid import UUID
 
 from sqlalchemy import case, func
@@ -7,10 +8,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session as DBSession
 from sqlmodel import select
 
+from backend.core.exceptions import ForbiddenException, TooManyRequestsException
+from backend.core.guest_access import guest_request_available_at
 from backend.db.models import QueueItem
 from backend.db.models.enum import ItemStatus
+from backend.db.models.room_ban import RoomBan
 from backend.db.models.session import Session as SessionModel
 from backend.db.models.song import Song
+from backend.db.models.user import User
 
 _ACTIVE_STATES = (
     ItemStatus.NOW_PLAYING,
@@ -170,6 +175,11 @@ class QueueRepository:
             IntegrityError: If a unique constraint violation occurs.
         """
         with _make_lock(self._session, session_id, group):
+            try:
+                guest = self._check_guest_request(session_id, added_by_user_id)
+            except Exception:
+                self._session.rollback()
+                raise
             stmt = select(func.coalesce(func.max(QueueItem.position), -1)).where(
                 QueueItem.session_id == session_id,
                 QueueItem.group == group,
@@ -184,11 +194,69 @@ class QueueRepository:
                 group=group,
             )
             self._session.add(queue_item)
-            self._session.commit()
+            if guest is not None:
+                guest.guest_last_requested_at = datetime.now(timezone.utc)
+                self._session.add(guest)
+            try:
+                # The request and its cooldown either both commit or both roll back.
+                self._session.commit()
+            except Exception:
+                self._session.rollback()
+                raise
 
             # Refresh outside the lock to get back the generated PK
             self._session.refresh(queue_item)
             return queue_item
+
+    def _check_guest_request(
+        self, session_id: UUID, user_id: UUID | None
+    ) -> User | None:
+        """Lock the account so simultaneous requests cannot spend the same quota."""
+        if user_id is None:
+            return None
+        user = self._session.exec(
+            select(User)
+            .where(User.id == user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        ).first()
+        if user is None or not user.is_guest:
+            return None
+        session = self._session.get(SessionModel, session_id, populate_existing=True)
+        if session is None or user.room_id != session.room_id:
+            raise ForbiddenException("Only current room members can request songs")
+        if (
+            self._session.exec(
+                select(RoomBan.id).where(
+                    RoomBan.room_id == session.room_id, RoomBan.user_id == user.id
+                )
+            ).first()
+            is not None
+        ):
+            raise ForbiddenException("You are banned from this room")
+        available = guest_request_available_at(user)
+        if available is None:
+            raise ForbiddenException(
+                "Join a room and wait 5 minutes before requesting a song"
+            )
+        remaining = (available - datetime.now(timezone.utc)).total_seconds()
+        if remaining > 0:
+            raise TooManyRequestsException(
+                remaining,
+                "Guests can request a song 5 minutes after first joining, "
+                "then once every 30 minutes.",
+            )
+        pending = self._session.exec(
+            select(QueueItem.id)
+            .where(
+                QueueItem.added_by_user_id == user_id,
+                QueueItem.playback_status.notin_(_ACTIVE_STATES),
+            )
+            .limit(1)
+        ).first()
+        if pending is not None:
+            raise ForbiddenException("You already have a song waiting in the queue")
+        return user
 
     def get_by_id(self, queue_item_id: UUID) -> QueueItem | None:
         """Fetch a single queue item by its primary key.

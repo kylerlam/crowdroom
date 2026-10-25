@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from backend.db.models.enum import StreamingPlatforms
 
@@ -102,6 +102,19 @@ class QueueItemUser(BaseModel):
 
     id: UUID
     username: str
+    is_guest: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def display_guest_name(cls, data):
+        """Keep guest login handles private in queue displays."""
+        if hasattr(data, "display_name"):
+            return {
+                "id": data.id,
+                "username": data.display_name,
+                "is_guest": data.is_guest,
+            }
+        return data
 
     model_config = ConfigDict(from_attributes=True)
 
