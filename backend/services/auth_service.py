@@ -7,6 +7,7 @@ from backend.core.exceptions import (
     InvalidCredentialsException,
     PasswordRequiredException,
 )
+from backend.core.rate_limit import limit_signup_from_source
 from backend.core.security import SecurityService
 from backend.db.models.enum import TokenType
 from backend.db.models.user import User
@@ -63,7 +64,9 @@ class AuthService:
         )
         return TokenResponse(access_token=token, token_type="bearer")
 
-    def local_login(self, user_data: LocalLoginRequest) -> TokenResponse:
+    def local_login(
+        self, user_data: LocalLoginRequest, source_ip: str | None = None
+    ) -> TokenResponse:
         """Authenticate or auto-register a user in LOCAL mode.
 
         If a password is provided and the user doesn't exist, creates a
@@ -72,6 +75,7 @@ class AuthService:
 
         Args:
             user_data: The schema containing username and optional password.
+            source_ip: Server-resolved client address for new-account limits.
 
         Returns:
             TokenResponse with access token.
@@ -86,6 +90,8 @@ class AuthService:
         user = self._user_service.get_by_username(username)
 
         if not user:
+            if source_ip is not None:
+                limit_signup_from_source(source_ip)
             user_to_create = UserCreate(
                 username=username, email=None, password=plain_password
             )

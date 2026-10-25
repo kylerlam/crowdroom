@@ -10,6 +10,7 @@ from fastapi import (
     Depends,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
     status,
@@ -196,6 +197,7 @@ def login(
 @router.post("/local-login", response_model=TokenResponse)
 def local_login(
     login_request: LocalLoginRequest,
+    request: Request,
     response: Response,
     auth_service: AuthService = Depends(get_auth_service),
 ) -> TokenResponse:
@@ -206,6 +208,7 @@ def local_login(
 
     Args:
         login_request: The username to login with.
+        request: Supplies the trusted server-resolved client address.
         response: The response used to set the auth cookie.
         auth_service: The authentication service.
 
@@ -221,7 +224,10 @@ def local_login(
             detail="Endpoint not available in ONLINE mode",
         )
     try:
-        token_response = auth_service.local_login(login_request)
+        token_response = auth_service.local_login(
+            login_request,
+            source_ip=request.client.host if request.client else "unknown",
+        )
         _set_auth_cookie(response, token_response.access_token)
         return token_response
     except PasswordRequiredException as exc:

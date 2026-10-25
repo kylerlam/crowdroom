@@ -2,6 +2,7 @@
 
 from contextlib import asynccontextmanager
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
@@ -41,7 +42,10 @@ from backend.core.exceptions import (
     UserBannedException,
 )
 from backend.core.network import is_ip_allowed
+from backend.core.rate_limit import limit_signup_from_source, request_limiter
+from backend.core.security import SecurityService
 from backend.db.database import create_db_and_tables
+from backend.db.models.enum import TokenType
 from backend.services.playback_poller_service import PlaybackPollerService
 
 
@@ -66,6 +70,42 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,
 )
+
+
+@app.middleware("http")
+async def limit_signup_and_room_entry(request: Request, call_next):
+    """Limit signup and joining by source, and joining by authenticated identity."""
+    if request.method != "POST":
+        return await call_next(request)
+    path = request.url.path.rstrip("/")
+    prefix = settings.API_V1_STR
+    source = request.client.host if request.client else "unknown"
+    try:
+        if path in {f"{prefix}/auth/register", f"{prefix}/users"}:
+            limit_signup_from_source(source)
+        if path == f"{prefix}/auth/local-login":
+            request_limiter.check("local-login", source, 60, 60)
+        if path.startswith(f"{prefix}/rooms/") and path.endswith("/join"):
+            request_limiter.check("join-source", source, 120, 60)
+            token = request.cookies.get(settings.AUTH_COOKIE_NAME)
+            if not token:
+                authorization = request.headers.get("authorization", "")
+                if authorization.lower().startswith("bearer "):
+                    token = authorization[7:]
+            account = None
+            if token:
+                try:
+                    payload = SecurityService(settings).decode_token(
+                        token, expected_type=TokenType.ACCESS
+                    )
+                    account = str(UUID(payload["sub"]))
+                except Exception:
+                    pass  # Authentication dependencies reject invalid credentials.
+            if account:
+                request_limiter.check("join-account", account, 12, 60)
+    except TooManyRequestsException as exc:
+        return await too_many_requests_handler(request, exc)
+    return await call_next(request)
 
 
 # --- API docs access control ----------------------------------------------
