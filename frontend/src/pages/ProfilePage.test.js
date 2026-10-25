@@ -6,7 +6,7 @@ const mocks = vi.hoisted(() => ({ apiPost: vi.fn(), apiGet: vi.fn() }));
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }));
 vi.mock('../components/ThemeToggle.vue', () => ({ default: { template: '<span />' } }));
 vi.mock('../composables/useAuth.js', () => ({
-  useAuth: () => ({ username: 'kyler', avatarUrl: null, setAvatarUrl: vi.fn() }),
+  useAuth: () => ({ username: 'kyler', publicId: 'CR-4827-9163', avatarUrl: null, setAvatarUrl: vi.fn() }),
 }));
 vi.mock('../composables/useToast.js', () => ({ useToast: () => ({ showToast: vi.fn() }) }));
 vi.mock('../composables/useApi.js', () => ({ apiPost: mocks.apiPost, apiGet: mocks.apiGet }));
@@ -21,6 +21,8 @@ describe('personal profile', () => {
     await flushPromises();
     expect(wrapper.text()).toContain('Password');
     expect(wrapper.find('[aria-label="Change avatar"]').exists()).toBe(true);
+    expect(wrapper.get('.user-identity-value').text()).toBe('CR-4827-9163');
+    expect(wrapper.find('[aria-label="Copy CrowdRoom ID CR-4827-9163"]').exists()).toBe(true);
     expect(wrapper.text()).not.toContain('Spotify');
     expect(mocks.apiGet).not.toHaveBeenCalled();
   });

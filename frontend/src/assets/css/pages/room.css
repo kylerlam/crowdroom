@@ -374,8 +374,21 @@
   white-space: nowrap;
 }
 
-.admissions-panel .member-name {
+.admission-identity {
   flex: 1;
+  min-width: 0;
+}
+
+.admission-identity .member-name {
+  display: block;
+}
+
+.admissions-panel .member-item {
+  flex-wrap: wrap;
+}
+
+.admissions-panel .members-list {
+  padding-top: var(--space-5);
 }
 
 .admissions-panel .btn {

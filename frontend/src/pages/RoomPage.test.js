@@ -87,9 +87,11 @@ async function renderRoom() {
 describe('room administrator controls', () => {
   it('lets managers approve pending members and refreshes requests from targeted events', async () => {
     mocks.userId.value = 'admin';
-    admissions = [{ user_id: 'new-member', username: 'New member', status: 'pending' }];
+    admissions = [{ user_id: 'new-member', username: 'New member', status: 'pending', public_id: 'CR-4827-9163' }];
     await renderRoom();
     expect(wrapper.find('[aria-label="Approve New member"]').exists()).toBe(true);
+    expect(wrapper.get('.admissions-panel .user-identity-value').text()).toBe('CR-4827-9163');
+    expect(wrapper.find('[aria-label="Copy CrowdRoom ID CR-4827-9163"]').exists()).toBe(true);
     mocks.apiPatch.mockImplementation(async () => { admissions = []; });
     await wrapper.get('[aria-label="Approve New member"]').trigger('click');
     await flushPromises();

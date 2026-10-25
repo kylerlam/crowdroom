@@ -35,6 +35,7 @@
           />
         </div>
         <h2 class="profile-username">{{ username }}</h2>
+        <UserIdentity :public-id="publicId" />
       </section>
 
       <!-- Password Section -->
@@ -95,9 +96,10 @@ import { apiPost } from '../composables/useApi.js';
 import { useAuth } from '../composables/useAuth.js';
 import { useToast } from '../composables/useToast.js';
 import ThemeToggle from '../components/ThemeToggle.vue';
+import UserIdentity from '../components/UserIdentity.vue';
 
 const router = useRouter();
-const { username, avatarUrl, setAvatarUrl } = useAuth();
+const { username, publicId, avatarUrl, setAvatarUrl } = useAuth();
 const { showToast } = useToast();
 
 const currentPassword = ref('');

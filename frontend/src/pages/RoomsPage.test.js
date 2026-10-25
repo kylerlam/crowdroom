@@ -35,7 +35,7 @@ beforeEach(() => {
     if (path === '/rooms/room/admission/status') return { status: 'approved' };
     return [];
   });
-  mocks.apiPost.mockResolvedValue({ room_id: 'room', room_name: 'Music room', status: 'pending' });
+  mocks.apiPost.mockResolvedValue({ room_id: 'room', room_name: 'Music room', status: 'pending', public_id: 'CR-4827-9163' });
 });
 afterEach(() => wrapper?.unmount());
 
@@ -53,6 +53,7 @@ describe('room admission entry points', () => {
       'Your request to join has been sent. Please contact the room host or an administrator for approval.',
     );
     expect(mocks.push).not.toHaveBeenCalled();
+    expect(wrapper.get('.admission-prompt .user-identity-value').text()).toBe('CR-4827-9163');
   });
 
   it('retains a validated private-room PIN after closing the modal and waiting for approval', async () => {

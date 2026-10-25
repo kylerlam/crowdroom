@@ -42,6 +42,7 @@ export function useAuth() {
   const username = computed(() => user.value?.username || '');
   const hasPassword = computed(() => !!user.value?.has_password);
   const userId = computed(() => user.value?.id || null);
+  const publicId = computed(() => user.value?.public_id || '');
   const avatarUrl = computed(() => user.value?.avatar_url || null);
 
   function setHasPassword(value) {
@@ -75,6 +76,7 @@ export function useAuth() {
     username,
     hasPassword,
     userId,
+    publicId,
     avatarUrl,
     fetchMe,
     setHasPassword,

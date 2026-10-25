@@ -296,7 +296,10 @@
           <p v-if="!admissions.length" class="text-secondary">No pending requests.</p>
           <ul class="members-list">
             <li v-for="request in admissions" :key="request.user_id" class="member-item">
-              <span class="member-name">{{ request.username }}</span>
+              <div class="admission-identity">
+                <span class="member-name">{{ request.username }}</span>
+                <UserIdentity :public-id="request.public_id" />
+              </div>
               <span v-if="request.status === 'rejected'" class="badge">Declined</span>
               <span class="member-actions">
                 <button class="btn btn-secondary" :aria-label="`Approve ${request.username}`" :disabled="admissionBusyIds.has(request.user_id)" @click="reviewAdmission(request, true)">Approve</button>
@@ -493,6 +496,7 @@ import { useWebSocket } from '../composables/useWebSocket.js';
 import { useToast } from '../composables/useToast.js';
 import ThemeToggle from '../components/ThemeToggle.vue';
 import TrackItem from '../components/TrackItem.vue';
+import UserIdentity from '../components/UserIdentity.vue';
 import { ALBUM_ART_PLACEHOLDER, onArtError } from '../composables/useAlbumArt.js';
 
 const props = defineProps({
