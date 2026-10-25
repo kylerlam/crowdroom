@@ -19,6 +19,7 @@ from backend.api.websocket import manager
 from backend.core.exceptions import (
     EntityNotFoundException,
     InvalidPlatformCredentialsException,
+    SpotifyConnectionRequiredException,
     SpotifyUpstreamException,
 )
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
@@ -141,6 +142,7 @@ class PlaybackControlService:
             except (
                 EntityNotFoundException,
                 InvalidPlatformCredentialsException,
+                SpotifyConnectionRequiredException,
                 SpotifyUpstreamException,
                 httpx.HTTPStatusError,
                 httpx.RequestError,

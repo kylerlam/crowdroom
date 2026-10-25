@@ -13,7 +13,10 @@ from backend.adapters.spotify_playback_adapter import (
 )
 from backend.api.websocket import manager
 from backend.core.config import settings
-from backend.core.exceptions import EntityNotFoundException
+from backend.core.exceptions import (
+    EntityNotFoundException,
+    SpotifyConnectionRequiredException,
+)
 from backend.db.database import engine
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
 from backend.db.models.song import Song
@@ -623,7 +626,7 @@ class PlaybackPollerService:
                             room_id,
                             error.response.status_code,
                         )
-                except EntityNotFoundException:
+                except EntityNotFoundException, SpotifyConnectionRequiredException:
                     logger.warning(
                         "Room %s: host has no OAuth connection, stopping poller",
                         room_id,

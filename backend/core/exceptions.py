@@ -202,6 +202,17 @@ class OAuthStateException(AppException):
             super().__init__(f"OAuth state validation failed: {reason}")
 
 
+class SpotifyConnectionRequiredException(AppException):
+    """Exception raised when Spotify playback needs account authorization."""
+
+    def __init__(self):
+        """Initialize the actionable Spotify account connection error."""
+        super().__init__(
+            "Spotify playback is not authorized. "
+            "The room host must connect Spotify in Profile."
+        )
+
+
 class ProfileIncompleteException(AppException):
     """Exception raised when an ONLINE-mode user lacks email or password.
 

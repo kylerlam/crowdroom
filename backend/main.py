@@ -34,6 +34,7 @@ from backend.core.exceptions import (
     InviteExpiredException,
     PasswordRequiredException,
     ProfileIncompleteException,
+    SpotifyConnectionRequiredException,
     SpotifyUpstreamException,
     TooManyRequestsException,
     UserAlreadyInRoomException,
@@ -150,6 +151,17 @@ async def too_many_requests_handler(
         status_code=429,
         content={"detail": str(exc), "retry_after": exc.retry_after},
         headers={"Retry-After": str(int(exc.retry_after))},
+    )
+
+
+@app.exception_handler(SpotifyConnectionRequiredException)
+async def spotify_connection_required_handler(
+    request: Request, exc: SpotifyConnectionRequiredException
+) -> JSONResponse:
+    """Return a reconnect action instead of exposing missing database records."""
+    return JSONResponse(
+        status_code=409,
+        content={"detail": str(exc), "code": "SPOTIFY_AUTH_REQUIRED"},
     )
 
 

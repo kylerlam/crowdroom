@@ -10,6 +10,7 @@ from sqlmodel import Session as DBSession
 from sqlmodel import SQLModel, create_engine
 
 from backend.adapters.spotify_playback_adapter import SpotifyPlaybackState
+from backend.core.exceptions import SpotifyConnectionRequiredException
 from backend.db.models import QueueItem, Room, Song, User
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
 from backend.db.models.session import Session as SessionModel
@@ -91,6 +92,23 @@ def test_exhausted_queue_auto_starts_next_added_song(recovery_stack):
     adapter.play.assert_awaited_once_with("spotify:track:second", None)
     assert session.current_song_id == "second"
     assert session.playback_status == ItemStatus.PLAYING
+
+
+def test_missing_oauth_keeps_a_successfully_added_song_queued(recovery_stack):
+    """Missing account consent cannot turn a persisted addition into an error."""
+    session, first, _, _, queue, _, control, adapter = recovery_stack
+    control._platform_connection_service.get_valid_access_token.side_effect = (
+        SpotifyConnectionRequiredException()
+    )
+
+    async def run():
+        await queue.add_to_queue(session.id, first.id)
+        await control.start_if_idle(session.id)
+
+    anyio.run(run)
+    assert queue.get_queue(session.id)[0].song_id == first.id
+    assert session.current_song_id is None
+    adapter.play.assert_not_awaited()
 
 
 @pytest.mark.parametrize("has_current_track", [False, True])

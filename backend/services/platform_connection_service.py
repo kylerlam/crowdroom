@@ -4,8 +4,12 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from backend.adapters.spotify_auth_adapter import SpotifyAuthAdapter
+from backend.core.config import settings
 from backend.core.encryption import decrypt_data, encrypt_data
-from backend.core.exceptions import EntityNotFoundException
+from backend.core.exceptions import (
+    EntityNotFoundException,
+    SpotifyConnectionRequiredException,
+)
 from backend.db.models import PlatformConnection, StreamingPlatforms
 from backend.db.models.enum import ConnectionType
 from backend.repositories.platform_connection_repo import PlatformConnectionRepo
@@ -54,20 +58,27 @@ class PlatformConnectionService:
         return self._repo.create(connection)
 
     def get_spotify_app_credentials(self, user_id: UUID) -> dict[str, str] | None:
-        """Return decrypted Spotify app credentials (client_id/secret) for user.
+        """Resolve per-user Spotify app credentials, falling back to settings.
 
         Args:
             user_id: UUID of the user.
 
         Returns:
-            Dict with client_id and client_secret, or None if not stored.
+            Complete client_id/client_secret pair, or None when unconfigured.
         """
         connection = self._repo.get_by_user_and_platform(
             user_id, StreamingPlatforms.SPOTIFY
         )
-        if not connection or not connection.credentials_encrypted:
-            return None
-        return decrypt_data(connection.credentials_encrypted)
+        if connection and connection.credentials_encrypted:
+            credentials = decrypt_data(connection.credentials_encrypted)
+            if credentials.get("client_id") and credentials.get("client_secret"):
+                return credentials
+        if settings.SPOTIFY_CLIENT_ID and settings.SPOTIFY_CLIENT_SECRET:
+            return {
+                "client_id": settings.SPOTIFY_CLIENT_ID,
+                "client_secret": settings.SPOTIFY_CLIENT_SECRET,
+            }
+        return None
 
     def get_connections(self, user_id: UUID) -> list[PlatformConnection]:
         """Retrieve all platform connections for a user.
@@ -153,17 +164,9 @@ class PlatformConnectionService:
             Decrypted access token string.
 
         Raises:
-            EntityNotFoundException: If no OAuth connection exists.
+            SpotifyConnectionRequiredException: If account authorization is missing.
         """
-        connection = self._repo.get_by_user_and_platform(user_id, platform)
-        is_oauth = (
-            connection
-            and connection.connection_type == ConnectionType.AUTHORIZATION_CODE
-        )
-        if not is_oauth:
-            raise EntityNotFoundException(
-                "PlatformConnection (OAuth)", f"{user_id}:{platform.value}"
-            )
+        connection = self._get_oauth_connection(user_id, platform)
 
         buffer = timedelta(minutes=5)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -191,14 +194,24 @@ class PlatformConnectionService:
             Fresh access token string.
 
         Raises:
-            EntityNotFoundException: If no OAuth connection exists.
+            SpotifyConnectionRequiredException: If account authorization is missing.
         """
-        connection = self._repo.get_by_user_and_platform(user_id, platform)
-        if not connection:
-            raise EntityNotFoundException(
-                "PlatformConnection (OAuth)", f"{user_id}:{platform.value}"
-            )
+        connection = self._get_oauth_connection(user_id, platform)
         return await self._refresh_access_token(connection)
+
+    def _get_oauth_connection(
+        self, user_id: UUID, platform: StreamingPlatforms
+    ) -> PlatformConnection:
+        """Require user OAuth tokens; app credentials alone cannot control playback."""
+        connection = self._repo.get_by_user_and_platform(user_id, platform)
+        if (
+            not connection
+            or connection.connection_type != ConnectionType.AUTHORIZATION_CODE
+            or not connection.access_token_encrypted
+            or not connection.refresh_token_encrypted
+        ):
+            raise SpotifyConnectionRequiredException()
+        return connection
 
     def _resolve_app_credentials(
         self, connection: PlatformConnection
@@ -213,8 +226,6 @@ class PlatformConnectionService:
         Returns:
             Tuple of (client_id, client_secret).
         """
-        from backend.core.config import settings
-
         if connection.credentials_encrypted:
             creds = decrypt_data(connection.credentials_encrypted)
             if creds.get("client_id") and creds.get("client_secret"):
@@ -233,10 +244,8 @@ class PlatformConnectionService:
             New decrypted access token string.
 
         Raises:
-            InvalidPlatformCredentialsException: If refresh token is revoked.
+            SpotifyConnectionRequiredException: If refresh authorization is revoked.
         """
-        from backend.core.exceptions import InvalidPlatformCredentialsException
-
         refresh_data = decrypt_data(connection.refresh_token_encrypted)
         refresh_token = refresh_data["refresh_token"]
         client_id, client_secret = self._resolve_app_credentials(connection)
@@ -254,9 +263,7 @@ class PlatformConnectionService:
                 },
             )
             if response.status_code in (400, 401):
-                raise InvalidPlatformCredentialsException(
-                    "Spotify refresh token revoked. Please reconnect."
-                )
+                raise SpotifyConnectionRequiredException()
             response.raise_for_status()
             token_response = response.json()
 
