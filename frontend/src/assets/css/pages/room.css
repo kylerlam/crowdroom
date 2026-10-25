@@ -13,6 +13,10 @@
 .room-header h2 {
   flex: 1;
   font-size: var(--font-size-lg);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .room-layout {
@@ -23,6 +27,10 @@
   max-width: 1400px;
   margin: 0 auto;
   width: 100%;
+}
+
+.room-layout > .panel {
+  min-width: 0;
 }
 
 /* Panel order (applies in the single-column mobile stack and the desktop
@@ -239,6 +247,13 @@
 .member-role {
   color: var(--accent);
   font-size: var(--font-size-xs);
+}
+
+.member-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .member-action-btn {

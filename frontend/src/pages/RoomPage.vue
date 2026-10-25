@@ -1,7 +1,7 @@
 <template>
   <div class="page room-page">
     <header class="room-header">
-      <h2>{{ roomName }}</h2>
+      <h2 :title="roomName">{{ roomName }}</h2>
       <div class="header-actions">
         <span class="badge">{{ roomCode }}</span>
         <button
@@ -87,9 +87,8 @@
               :class="{ 'queue-pinned': item.is_pinned }"
             >
               <template #actions>
-                <span v-if="item.is_pinned" class="pin-badge" title="Pinned priority">
+                <span v-if="item.is_pinned" class="pin-badge" role="img" aria-label="Pinned" title="Pinned priority">
                   <i class="ph ph-push-pin"></i>
-                  <span class="sr-only">Pinned</span>
                 </span>
                 <template v-if="isManager">
                   <button
@@ -188,7 +187,7 @@
               <span v-else class="member-avatar">{{
                 (member.username || '?')[0].toUpperCase()
               }}</span>
-              <span>{{ member.username || 'Unknown' }}</span>
+              <span class="member-name">{{ member.username || 'Unknown' }}</span>
               <span v-if="member.id === hostUserId" class="member-role">Host</span>
               <span v-else-if="adminUserIds.includes(member.id)" class="member-role">Admin</span>
               <span
