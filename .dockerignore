@@ -42,6 +42,9 @@ backend/.env.*
 !backend/.env.prod.example
 
 # Logs / docs / misc
+docs/
+.pnpm-store
+**/.pnpm-store
 *.log
 README.md
 CODE_OF_CONDUCT.md
