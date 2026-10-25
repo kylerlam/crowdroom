@@ -184,6 +184,23 @@ class ConnectionManager:
             if tasks:
                 await asyncio.gather(*tasks)
 
+    async def broadcast_to_users(
+        self, message: dict[str, Any], room_id: str, user_ids: set[UUID]
+    ) -> None:
+        """Send a room message only to the selected users' connections."""
+        connections = [
+            connection
+            for connection in self.active_connections.get(room_id, set())
+            if self._socket_user.get(connection) in user_ids
+        ]
+        if connections:
+            await asyncio.gather(
+                *(
+                    self._safe_send(connection, message, room_id)
+                    for connection in connections
+                )
+            )
+
     async def _safe_send(
         self, connection: WebSocket, message: dict[str, Any], room_id: str
     ) -> None:

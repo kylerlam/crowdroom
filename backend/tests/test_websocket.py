@@ -336,3 +336,61 @@ def test_external_endpoint_cancellation_propagates_and_cleans_up():
     assert room_id not in manager.active_connections
     assert websocket not in manager._last_pong
     assert websocket not in manager._socket_user
+
+
+def test_targeted_broadcast_reaches_all_selected_sockets_in_the_room_only():
+    """Private room status reaches managers, excluding other members and rooms."""
+    from unittest.mock import AsyncMock
+
+    from backend.api.websocket import ConnectionManager
+
+    connections = ConnectionManager()
+    room_id = str(uuid4())
+    host_id, admin_id, member_id = uuid4(), uuid4(), uuid4()
+    host_one, host_two, admin, member, other_room = [
+        AsyncMock(spec=WebSocket) for _ in range(5)
+    ]
+    message = {"type": "oauth_required"}
+
+    async def run():
+        await connections.connect(host_one, room_id, host_id)
+        await connections.connect(host_two, room_id, host_id)
+        await connections.connect(admin, room_id, admin_id)
+        await connections.connect(member, room_id, member_id)
+        await connections.connect(other_room, str(uuid4()), host_id)
+        await connections.broadcast_to_users(message, room_id, {host_id, admin_id})
+
+    anyio.run(run)
+    for socket in (host_one, host_two, admin):
+        socket.send_json.assert_awaited_once_with(message)
+    member.send_json.assert_not_awaited()
+    other_room.send_json.assert_not_awaited()
+
+
+def test_targeted_broadcast_cleans_up_failed_connections():
+    """A failed private send removes all connection bookkeeping."""
+    from unittest.mock import AsyncMock
+
+    from backend.api.websocket import ConnectionManager
+
+    connections = ConnectionManager()
+    room_id, user_id = str(uuid4()), uuid4()
+    websocket = AsyncMock(spec=WebSocket)
+    websocket.send_json.side_effect = RuntimeError("connection closed")
+
+    async def run():
+        await connections.connect(websocket, room_id, user_id)
+        await connections.broadcast_to_users({"type": "oauth_required"}, room_id, set())
+        websocket.send_json.assert_not_awaited()
+        await connections.broadcast_to_users(
+            {"type": "oauth_required"}, room_id, {user_id}
+        )
+        await connections.broadcast_to_users(
+            {"type": "oauth_required"}, room_id, {user_id}
+        )
+
+    anyio.run(run)
+    websocket.send_json.assert_awaited_once()
+    assert room_id not in connections.active_connections
+    assert websocket not in connections._last_pong
+    assert websocket not in connections._socket_user
