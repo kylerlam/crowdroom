@@ -594,9 +594,7 @@ class TestQueueItemSongEagerLoaded:
             )
             db_session.add(room_row)
             db_session.flush()
-            db_session.add(
-                Session(id=session_id, room_id=room_row.id)
-            )
+            db_session.add(Session(id=session_id, room_id=room_row.id))
             for position in range(2):
                 song_row = Song(
                     external_id=f"track_{position}",
@@ -615,9 +613,7 @@ class TestQueueItemSongEagerLoaded:
                 )
             db_session.commit()
 
-        with patch(
-            "backend.services.playback_poller_service.engine", engine
-        ):
+        with patch("backend.services.playback_poller_service.engine", engine):
             yield session_id
 
     def test_get_current_queue_item_song_accessible_after_session_close(
@@ -664,6 +660,7 @@ class TestAdvanceQueueOwnership:
 
         async def _run():
             with (
+                patch.object(poller, "_get_session_state", return_value=session),
                 patch.object(
                     poller,
                     "_build_playback_service_with_queue",
@@ -707,6 +704,7 @@ class TestAdvanceQueueOwnership:
 
         async def _run():
             with (
+                patch.object(poller, "_get_session_state", return_value=session),
                 patch.object(
                     poller,
                     "_build_playback_service_with_queue",
@@ -749,6 +747,7 @@ class TestAdvanceQueueOwnership:
 
         async def _run():
             with (
+                patch.object(poller, "_get_session_state", return_value=session),
                 patch.object(
                     poller,
                     "_build_playback_service_with_queue",

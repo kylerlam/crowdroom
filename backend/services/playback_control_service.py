@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
+from weakref import WeakValueDictionary
 
 import httpx
 
@@ -28,6 +30,14 @@ from backend.services.queue_service import QueueService
 from backend.services.room_service import RoomService
 
 logger = logging.getLogger(__name__)
+# ponytail: one worker; use database locks if multiple workers are added.
+_playback_locks: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
+
+
+def _room_playback_lock(room_id: UUID) -> asyncio.Lock:
+    """Share a room's in-flight playback lock across request-scoped services."""
+    return _playback_locks.setdefault(room_id, asyncio.Lock())
+
 
 if TYPE_CHECKING:
     from backend.services.playback_poller_service import PlaybackPollerService
@@ -106,28 +116,38 @@ class PlaybackControlService:
         session = self._session_repo.get_by_id(session_id)
         if session is None:
             return
-        if session.playback_status in {
-            ItemStatus.PAUSED,
-            ItemStatus.PLAYING,
-            ItemStatus.NOW_PLAYING,
-            ItemStatus.BUFFERING,
-        }:
-            return
-        if session.current_song_id and session.playback_status != ItemStatus.STOPPED:
-            return
-        next_item = self._queue_service.get_current_song(session_id)
-        if next_item is None:
-            return
-        room = self._room_service.get_room(session.room_id)
-        try:
-            await self.play(room.id, room.host_user_id, next_item.song_id)
-        except (
-            EntityNotFoundException,
-            InvalidPlatformCredentialsException,
-            SpotifyUpstreamException,
-            httpx.HTTPStatusError,
-        ):
-            logger.warning("Could not auto-start queued playback for room %s", room.id)
+        async with _room_playback_lock(session.room_id):
+            session = self._session_repo.get_by_id(session_id, fresh=True)
+            if session is None:
+                return
+            if session.playback_status in {
+                ItemStatus.PAUSED,
+                ItemStatus.PLAYING,
+                ItemStatus.NOW_PLAYING,
+                ItemStatus.BUFFERING,
+            }:
+                return
+            if (
+                session.current_song_id
+                and session.playback_status != ItemStatus.STOPPED
+            ):
+                return
+            next_item = self._queue_service.get_current_song(session_id)
+            if next_item is None:
+                return
+            room = self._room_service.get_room(session.room_id)
+            try:
+                await self._play_locked(room.id, room.host_user_id, next_item.song_id)
+            except (
+                EntityNotFoundException,
+                InvalidPlatformCredentialsException,
+                SpotifyUpstreamException,
+                httpx.HTTPStatusError,
+                httpx.RequestError,
+            ):
+                logger.warning(
+                    "Could not auto-start queued playback for room %s", room.id
+                )
 
     async def play(
         self,
@@ -148,10 +168,21 @@ class PlaybackControlService:
             EntityNotFoundException: If room or song not found.
             ForbiddenException: If user cannot manage the room.
         """
+        async with _room_playback_lock(room_id):
+            await self._play_locked(room_id, user_id, song_id, device_id)
+
+    async def _play_locked(
+        self,
+        room_id: UUID,
+        user_id: UUID,
+        song_id: UUID | None = None,
+        device_id: str | None = None,
+    ) -> None:
+        """Play while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
         host_user_id = room.host_user_id
 
-        session = self._session_repo.get_by_room(room_id)
+        session = self._session_repo.get_by_room(room_id, fresh=True)
         if song_id is None and (
             session is None
             or not session.current_song_id
@@ -203,7 +234,7 @@ class PlaybackControlService:
             raise EntityNotFoundException("Song", song_id)
 
         adapter = await self._get_adapter(host_user_id)
-        session = self._session_repo.get_by_room(room_id)
+        session = self._session_repo.get_by_room(room_id, fresh=True)
 
         already_playing = (
             session
@@ -276,6 +307,11 @@ class PlaybackControlService:
             EntityNotFoundException: If room not found.
             ForbiddenException: If user cannot manage the room.
         """
+        async with _room_playback_lock(room_id):
+            await self._pause_locked(room_id, user_id)
+
+    async def _pause_locked(self, room_id: UUID, user_id: UUID) -> None:
+        """Pause while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
         host_user_id = room.host_user_id
         adapter = await self._get_adapter(host_user_id)
@@ -291,7 +327,7 @@ class PlaybackControlService:
                     detail=self._spotify_error_detail(error),
                 ) from error
 
-        session = self._session_repo.get_by_room(room_id)
+        session = self._session_repo.get_by_room(room_id, fresh=True)
         if session:
             current_item = self._queue_service.get_current_song(session.id)
             if (
@@ -329,10 +365,15 @@ class PlaybackControlService:
             EntityNotFoundException: If room not found.
             ForbiddenException: If user cannot manage the room.
         """
+        async with _room_playback_lock(room_id):
+            await self._skip_locked(room_id, user_id)
+
+    async def _skip_locked(self, room_id: UUID, user_id: UUID) -> None:
+        """Skip while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
         host_user_id = room.host_user_id
 
-        session = self._session_repo.get_by_room(room_id)
+        session = self._session_repo.get_by_room(room_id, fresh=True)
         if session:
             await self._playback_service.finish_song(session.id)
 

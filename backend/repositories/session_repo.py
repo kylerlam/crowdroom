@@ -41,28 +41,34 @@ class SessionRepository:
             self._session.rollback()
             raise
 
-    def get_by_id(self, session_id: UUID) -> SessionModel | None:
+    def get_by_id(
+        self, session_id: UUID, *, fresh: bool = False
+    ) -> SessionModel | None:
         """Retrieves a session by its ID.
 
         Args:
             session_id (UUID): The unique identifier of the session.
+            fresh: Reload state that another playback request may have changed.
 
         Returns:
             SessionModel | None: The session instance if found, otherwise None.
         """
-        return self._session.get(SessionModel, session_id)
+        return self._session.get(SessionModel, session_id, populate_existing=fresh)
 
-    def get_by_room(self, room_id: UUID) -> SessionModel | None:
+    def get_by_room(self, room_id: UUID, *, fresh: bool = False) -> SessionModel | None:
         """Retrieves the session for a specific room.
 
         Args:
             room_id (UUID): The unique identifier of the room.
+            fresh: Reload state that another playback request may have changed.
 
         Returns:
             SessionModel | None: The session instance if found, otherwise None.
         """
         return self._session.exec(
-            select(SessionModel).where(SessionModel.room_id == room_id)
+            select(SessionModel)
+            .where(SessionModel.room_id == room_id)
+            .execution_options(populate_existing=fresh)
         ).first()
 
     def get_all(self) -> list[SessionModel]:

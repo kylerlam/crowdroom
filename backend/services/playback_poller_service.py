@@ -23,6 +23,7 @@ from backend.repositories.queue_repo import QueueRepository
 from backend.repositories.session_repo import SessionRepository
 from backend.repositories.song_repo import SongRepository
 from backend.services.platform_connection_service import PlatformConnectionService
+from backend.services.playback_control_service import _room_playback_lock
 from backend.services.playback_service import PlaybackService
 from backend.services.queue_service import QueueService
 
@@ -275,6 +276,25 @@ class PlaybackPollerService:
             host_user_id: Host whose Spotify to control.
             adapter: Already-authenticated Spotify adapter.
         """
+        async with _room_playback_lock(room_id):
+            latest = await asyncio.to_thread(self._get_session_state, room_id)
+            if latest is None or latest.playback_status == ItemStatus.PAUSED:
+                return
+            if (
+                latest.current_song_id != session.current_song_id
+                or latest.playback_started_at != session.playback_started_at
+            ):
+                return
+            await self._advance_queue_locked(latest, room_id, host_user_id, adapter)
+
+    async def _advance_queue_locked(
+        self,
+        session,
+        room_id: UUID,
+        host_user_id: UUID,
+        adapter: SpotifyPlaybackAdapter,
+    ) -> None:
+        """Advance using a fresh session while manual controls are serialized."""
         playback_service, queue_service = self._build_playback_service_with_queue()
         current_item = queue_service.get_current_song(session.id)
         queue_owns_current = self._queue_owns_current_track(session, current_item)
