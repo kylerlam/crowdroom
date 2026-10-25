@@ -229,7 +229,7 @@ def test_role_controls_host_status_access_and_owner_device_selection(
     else:
         suffix = "spotify/status" if operation == "status" else "devices"
         result = client.get(f"/api/v1/playback/{suffix}")
-    if role == "member" or (role == "admin" and operation == "select"):
+    if role == "member" or (role == "admin" and operation in {"devices", "select"}):
         assert result.status_code == 403
         adapter.get_devices.assert_not_awaited()
         service._platform_connection_service.is_spotify_authorized.assert_not_called()

@@ -130,6 +130,36 @@ def test_session_finish_rejects_unauthenticated_request(role_client):
 
 
 @pytest.mark.parametrize("role", ["host", "admin", "member"])
+@pytest.mark.parametrize("device_id", ["iphone", "", None])
+def test_session_patch_cannot_bypass_owner_only_device_selection(
+    role_client, role, device_id
+):
+    """Explicitly setting or clearing a device requires the room host."""
+    client, actor, _room, session, host, admin, member = role_client
+    actor["user"] = {"host": host, "admin": admin, "member": member}[role]
+    session.current_device_id = "saved-device"
+    service = client.app.dependency_overrides[get_session_service]()
+
+    def save(_session_id, data):
+        session.current_device_id = data.current_device_id
+        return session
+
+    service.update_session.side_effect = save
+    response = client.patch(
+        f"/api/v1/session/{session.id}", json={"current_device_id": device_id}
+    )
+
+    if role == "host":
+        assert response.status_code == 200
+        assert response.json()["current_device_id"] == device_id
+        service.update_session.assert_called_once()
+    else:
+        assert response.status_code == 403
+        assert session.current_device_id == "saved-device"
+        service.update_session.assert_not_called()
+
+
+@pytest.mark.parametrize("role", ["host", "admin", "member"])
 def test_finish_route_starts_next_song_on_server_only_after_authorized_finish(
     role_client, role
 ):

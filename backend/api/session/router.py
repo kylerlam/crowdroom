@@ -124,6 +124,8 @@ async def update_session(
     """
     current_session = session_service.get_session(session_id)
     room_service.assert_manager(current_session.room_id, current_user.id)
+    if "current_device_id" in session_data.model_fields_set:
+        room_service.assert_host(current_session.room_id, current_user.id)
     session = session_service.update_session(session_id, session_data)
     return ReadSession.model_validate(session)
 

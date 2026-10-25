@@ -524,8 +524,8 @@ class PlaybackControlService:
         }
 
     async def get_devices(self, room_id: UUID, user_id: UUID) -> dict:
-        """List the host's Connect devices and the room's saved preference."""
-        room = self._room_service.assert_manager(room_id, user_id)
+        """Let the host list Connect devices and the room's saved preference."""
+        room = self._room_service.assert_host(room_id, user_id)
         adapter = await self._get_adapter(room.host_user_id)
         for attempt in range(2):
             try:
