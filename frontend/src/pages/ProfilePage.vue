@@ -36,10 +36,11 @@
         </div>
         <h2 class="profile-username">{{ username }}</h2>
         <UserIdentity :public-id="publicId" />
+        <p v-if="isGuest" class="text-secondary">Guest · Your ID and request allowance stay with this browser.</p>
       </section>
 
       <!-- Password Section -->
-      <section class="panel">
+      <section v-if="!isGuest" class="panel">
         <h3><i class="ph ph-lock"></i> Password</h3>
         <form class="profile-form" @submit.prevent="changePassword">
           <div class="input-group">
@@ -99,7 +100,7 @@ import ThemeToggle from '../components/ThemeToggle.vue';
 import UserIdentity from '../components/UserIdentity.vue';
 
 const router = useRouter();
-const { username, publicId, avatarUrl, setAvatarUrl } = useAuth();
+const { username, publicId, avatarUrl, setAvatarUrl, isGuest } = useAuth();
 const { showToast } = useToast();
 
 const currentPassword = ref('');

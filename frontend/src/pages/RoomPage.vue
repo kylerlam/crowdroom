@@ -47,9 +47,10 @@
         <div v-if="!currentSong" class="empty-state">
           <i class="ph ph-play"></i>
           <button
+            v-if="isManager"
             class="btn btn-primary"
-            :disabled="!isManager || resuming"
-            :title="isManager ? 'Resume playback' : 'Only room managers can resume playback'"
+            :disabled="resuming"
+            title="Resume playback"
             @click="resumePlayback"
           >Resume</button>
           <p v-if="showEmptyQueuePrompt && queueItems.length === 0" class="empty-queue-prompt" role="status">
@@ -203,13 +204,17 @@
               @input="debouncedSearch"
             />
           </div>
+          <p v-if="isGuest" class="guest-request-notice text-secondary">
+            {{ guestRequestMessage }}
+          </p>
           <div class="track-list">
             <TrackItem v-for="track in searchResults" :key="track.external_id" :track="track">
               <template #actions>
                 <button
                   class="btn btn-secondary"
-                  title="Add to queue"
-                  :disabled="addingIds.has(track.external_id)"
+                  :title="isGuest && guestRequestBlocked ? guestRequestMessage : 'Add to queue'"
+                  :aria-label="`Add ${track.title} to queue`"
+                  :disabled="addingIds.has(track.external_id) || (isGuest && (guestRequestBlocked || addingIds.size > 0))"
                   @click="addToQueue(track.external_id)"
                 >
                   <i class="ph ph-plus"></i>
@@ -253,7 +258,7 @@
                 class="member-actions"
               >
                 <button
-                  v-if="isHost"
+                  v-if="isHost && !member.is_guest"
                   type="button"
                   class="member-action-btn"
                   :aria-label="`${adminUserIds.includes(member.id) ? 'Revoke admin from' : 'Make admin:'} ${member.username || 'user'}`"
@@ -504,7 +509,7 @@ const props = defineProps({
 });
 
 const router = useRouter();
-const { userId } = useAuth();
+const { userId, isGuest, guestRequestAvailableAt, serverClockOffset, fetchMe } = useAuth();
 const { connectToRoom, disconnect, onEvent, offEvent } = useWebSocket();
 const { showToast } = useToast();
 
@@ -521,6 +526,27 @@ const currentSong = ref(null);
 const queueItems = ref([]);
 const queueBusyIds = ref(new Set());
 const pinnedCount = computed(() => queueItems.value.filter((item) => item.is_pinned).length);
+const quotaNow = ref(Date.now());
+const guestRetryUntil = ref(0);
+let guestQuotaTimer = null;
+const guestPending = computed(() => queueItems.value.some((item) => item.added_by?.id === userId.value));
+const guestWaitSeconds = computed(() => {
+  const availableAt = Date.parse(guestRequestAvailableAt?.value);
+  const serverDeadline = Number.isFinite(availableAt) ? availableAt - (serverClockOffset?.value || 0) : 0;
+  return Math.max(0, Math.ceil((Math.max(serverDeadline, guestRetryUntil.value) - quotaNow.value) / 1000));
+});
+const guestRequestBlocked = computed(() => !guestRequestAvailableAt?.value || guestPending.value || guestWaitSeconds.value > 0);
+const guestRequestMessage = computed(() => {
+  const rules = 'Guests wait 5 minutes after first joining, then may request one song every 30 minutes. One queued song at a time.';
+  if (guestPending.value) return `Your song is already in the queue. ${rules}`;
+  if (guestWaitSeconds.value > 0) {
+    const minutes = Math.floor(guestWaitSeconds.value / 60);
+    const seconds = String(guestWaitSeconds.value % 60).padStart(2, '0');
+    return `You can request your next song in ${minutes}:${seconds}. ${rules}`;
+  }
+  if (!guestRequestAvailableAt?.value) return `Checking your request allowance… ${rules}`;
+  return `You can request a song now. ${rules}`;
+});
 const members = ref([]);
 const bannedUsers = ref([]);
 const admissions = ref([]);
@@ -597,6 +623,11 @@ onMounted(async () => {
   }
 
   try {
+    if (isGuest?.value) {
+      await fetchMe();
+      quotaNow.value = Date.now();
+      guestQuotaTimer = setInterval(() => { quotaNow.value = Date.now(); }, 1000);
+    }
     await loadRoom();
     await loadSession();
     await syncPlaybackPosition();
@@ -616,6 +647,7 @@ onUnmounted(() => {
   window.removeEventListener('focus', refreshSpotifyConnection);
   teardownWebSocket();
   clearTimeout(searchTimeout);
+  clearInterval(guestQuotaTimer);
   if (searchController) searchController.abort();
   if (progressFrame) cancelAnimationFrame(progressFrame);
 });
@@ -991,6 +1023,7 @@ async function checkSpotifyConnection() {
 }
 
 function refreshSpotifyConnection() {
+  if (isGuest?.value) return fetchMe();
   if (isManager.value) return checkSpotifyConnection();
 }
 
@@ -1069,15 +1102,25 @@ async function addToQueue(externalId) {
     return;
   }
   if (addingIds.value.has(externalId)) return;
+  if (isGuest?.value && (guestRequestBlocked.value || addingIds.value.size > 0)) return;
   addingIds.value = new Set(addingIds.value).add(externalId);
   try {
     await apiGet(`/search/${externalId}?room_id=${roomId.value}`);
     const dbSong = await apiGet(`/songs/by-external/${externalId}?platform=spotify`);
     await apiPost('/queue/', { session_id: sessionId.value, song_id: dbSong.id, group: 'manual' });
     showToast('Added to queue', 'success');
-    loadQueue();
+    await loadQueue();
+    if (isGuest?.value) {
+      await fetchMe();
+      quotaNow.value = Date.now();
+    }
   } catch (err) {
     showToast(err.detail || 'Failed to add song');
+    if (isGuest?.value && err.status === 429) {
+      guestRetryUntil.value = Date.now() + Math.max(0, err.retryAfter || 0) * 1000;
+      quotaNow.value = Date.now();
+      await fetchMe();
+    }
   } finally {
     const next = new Set(addingIds.value);
     next.delete(externalId);

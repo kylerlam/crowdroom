@@ -7,6 +7,21 @@ afterEach(() => {
 });
 
 describe('public account identity', () => {
+  it('loads the guest allowance and server clock without deriving identity from the nickname', async () => {
+    const now = Date.now();
+    const serverDate = new Date(now + 3600000).toUTCString();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      headers: { get: () => serverDate },
+      json: async () => ({ id: 'guest-uuid', username: 'Listener', is_guest: true, guest_request_available_at: '2026-10-26T10:05:00Z' }),
+    }));
+    const auth = useAuth();
+    await fetchMe();
+    expect(auth.isGuest.value).toBe(true);
+    expect(auth.guestRequestAvailableAt.value).toBe('2026-10-26T10:05:00Z');
+    expect(auth.serverClockOffset.value).toBeGreaterThan(3598000);
+    expect(auth.userId.value).toBe('guest-uuid');
+  });
   it('loads the server-issued ID from the same authenticated identity used after login', async () => {
     const fetch = vi.fn().mockResolvedValue({
       ok: true,

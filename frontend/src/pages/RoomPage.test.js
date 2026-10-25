@@ -11,6 +11,10 @@ const mocks = vi.hoisted(() => ({
   apiDelete: vi.fn(),
   handlers: new Map(),
   showToast: vi.fn(),
+  isGuest: null,
+  guestRequestAvailableAt: null,
+  serverClockOffset: null,
+  fetchMe: vi.fn(),
 }));
 
 vi.mock('vue-router', () => ({
@@ -18,7 +22,13 @@ vi.mock('vue-router', () => ({
   onBeforeRouteLeave: vi.fn(),
 }));
 vi.mock('../components/ThemeToggle.vue', () => ({ default: { template: '<span />' } }));
-vi.mock('../composables/useAuth.js', () => ({ useAuth: () => ({ userId: mocks.userId }) }));
+vi.mock('../composables/useAuth.js', async () => {
+  const { ref } = await import('vue');
+  mocks.isGuest = ref(false);
+  mocks.guestRequestAvailableAt = ref(null);
+  mocks.serverClockOffset = ref(0);
+  return { useAuth: () => ({ userId: mocks.userId, isGuest: mocks.isGuest, guestRequestAvailableAt: mocks.guestRequestAvailableAt, serverClockOffset: mocks.serverClockOffset, fetchMe: mocks.fetchMe }) };
+});
 vi.mock('../composables/useApi.js', () => ({
   apiGet: mocks.apiGet,
   apiPost: mocks.apiPost,
@@ -50,6 +60,10 @@ beforeEach(() => {
   vi.clearAllMocks();
   mocks.handlers.clear();
   mocks.userId.value = 'owner';
+  mocks.isGuest.value = false;
+  mocks.guestRequestAvailableAt.value = null;
+  mocks.serverClockOffset.value = 0;
+  mocks.fetchMe.mockResolvedValue({});
   room = { host_user_id: 'owner', admin_user_ids: ['admin'], room_name: 'Music room', room_code: 'ABC' };
   pending = [];
   authorized = true;
@@ -73,7 +87,7 @@ beforeEach(() => {
   });
 });
 
-afterEach(() => wrapper?.unmount());
+afterEach(() => { wrapper?.unmount(); vi.useRealTimers(); });
 
 async function renderRoom() {
   wrapper = mount(RoomPage, {
@@ -83,6 +97,78 @@ async function renderRoom() {
   await flushPromises();
   return wrapper;
 }
+
+describe('guest song requests', () => {
+  async function renderGuest(availableAfterSeconds = 300) {
+    mocks.isGuest.value = true;
+    mocks.userId.value = 'guest';
+    mocks.guestRequestAvailableAt.value = new Date(Date.now() + availableAfterSeconds * 1000).toISOString();
+    await renderRoom();
+    await wrapper.get('input[placeholder="Search for songs..."]').setValue('Honey');
+    await vi.advanceTimersByTimeAsync(300);
+    await flushPromises();
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    const defaultGet = mocks.apiGet.getMockImplementation();
+    mocks.apiGet.mockImplementation(async (path) => {
+      if (path.startsWith('/search/?')) return [{ external_id: 'honey', title: 'Honey', artist: 'Artist' }];
+      if (path === '/songs/by-external/honey?platform=spotify') return { id: 'song' };
+      return defaultGet(path);
+    });
+  });
+
+  it('shows the first-entry countdown and enables a request only when five minutes have elapsed', async () => {
+    await renderGuest();
+    expect(wrapper.get('.guest-request-notice').text()).toContain('5:00');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
+    expect(mocks.fetchMe).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(300000);
+    expect(wrapper.get('.guest-request-notice').text()).toContain('You can request a song now');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('refreshes the persisted quota after a successful request and shows the thirty-minute wait', async () => {
+    await renderGuest(-1);
+    mocks.apiPost.mockImplementation(async () => {
+      mocks.guestRequestAvailableAt.value = new Date(Date.now() + 1800000).toISOString();
+      return {};
+    });
+    await wrapper.get('[aria-label="Add Honey to queue"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiPost).toHaveBeenCalledWith('/queue/', { session_id: 'session', song_id: 'song', group: 'manual' });
+    expect(mocks.fetchMe).toHaveBeenCalledTimes(2);
+    expect(wrapper.get('.guest-request-notice').text()).toContain('30:00');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('keeps a second request blocked while the guest already has one pending song', async () => {
+    pending = [{ id: 'pending', song: { title: 'Waiting' }, added_by: { id: 'guest', username: 'Guest' } }];
+    await renderGuest(-1);
+    expect(wrapper.get('.guest-request-notice').text()).toContain('Your song is already in the queue');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
+    mocks.handlers.get('queue_updated')({ queue: [] });
+    await flushPromises();
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('honors a server retry deadline when a stale tab attempts a request', async () => {
+    await renderGuest(-1);
+    mocks.apiPost.mockRejectedValue({ status: 429, retryAfter: 120, detail: 'Guest requests are limited' });
+    await wrapper.get('[aria-label="Add Honey to queue"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.guest-request-notice').text()).toContain('2:00');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
+    expect(mocks.showToast).toHaveBeenCalledWith('Guest requests are limited');
+  });
+
+  it('uses the server clock offset so a wrong device clock cannot skip the wait in the UI', async () => {
+    mocks.serverClockOffset.value = 3600000;
+    await renderGuest(3900);
+    expect(wrapper.get('.guest-request-notice').text()).toContain('5:00');
+  });
+});
 
 describe('room administrator controls', () => {
   it('lets managers approve pending members and refreshes requests from targeted events', async () => {
@@ -233,10 +319,19 @@ describe('idle playback recovery', () => {
     expect(mocks.apiPost).toHaveBeenCalledWith('/playback/play', { song_id: 'song' });
   });
 
-  it('disables resume for ordinary members', async () => {
+  it.each([false, true])('hides playback and device controls from ordinary members (guest: %s)', async (isGuest) => {
     mocks.userId.value = 'guest';
+    mocks.isGuest.value = isGuest;
+    mocks.guestRequestAvailableAt.value = new Date(Date.now() + 300000).toISOString();
     await renderRoom();
-    expect(wrapper.get('[title="Only room managers can resume playback"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.find('[title="Resume playback"]').exists()).toBe(false);
+    expect(wrapper.find('.playback-controls').exists()).toBe(false);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
+    expect(wrapper.find('[title="Show invite QR"]').exists()).toBe(false);
+    expect(wrapper.find('.member-actions').exists()).toBe(false);
+    expect(wrapper.find('.queue-pin').exists()).toBe(false);
+    expect(wrapper.find('.queue-jump').exists()).toBe(false);
+    expect(wrapper.find('.queue-dequeue').exists()).toBe(false);
   });
 
   it('does not auto-resume from browser song notifications after a pause', async () => {

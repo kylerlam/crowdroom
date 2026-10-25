@@ -35,6 +35,7 @@
             autocomplete="current-password"
           />
         </div>
+        <p class="text-secondary">Guests can request a first song 5 minutes after joining a room, then one every 30 minutes. One queued song at a time.</p>
         <button type="submit" class="btn btn-primary btn-full">Enter</button>
       </form>
 
@@ -107,6 +108,18 @@
         </form>
       </div>
 
+      <section v-if="mode !== 'LOCAL'" class="guest-entry">
+        <h3>Join as a guest</h3>
+        <p class="text-secondary">Just a nickname. No approval needed to join. Request your first song after 5 minutes, then one every 30 minutes. One queued song at a time.</p>
+        <form class="login-form" @submit.prevent="guestLogin">
+          <div class="input-group">
+            <label for="guest-name">Nickname</label>
+            <input id="guest-name" v-model="guestName" type="text" class="input" maxlength="32" placeholder="Your name" autocomplete="nickname" required />
+          </div>
+          <button type="submit" class="btn btn-secondary btn-full" :disabled="guestLoading">{{ guestLoading ? 'Joining…' : 'Continue as guest' }}</button>
+        </form>
+      </section>
+
       <p v-if="error" class="error-text">{{ error }}</p>
     </div>
 
@@ -137,6 +150,8 @@ const password = ref('');
 const regUsername = ref('');
 const regEmail = ref('');
 const regPassword = ref('');
+const guestName = ref('');
+const guestLoading = ref(false);
 
 const inviteToken = ref('');
 
@@ -165,7 +180,7 @@ async function localLogin() {
     if (localPassword.value) {
       body.password = localPassword.value;
     }
-    await apiPost('/auth/local-login', body);
+    await apiPost(localPassword.value ? '/auth/local-login' : '/auth/guest', body);
     await fetchMe();
     await postAuthRedirect();
   } catch (err) {
@@ -199,6 +214,21 @@ async function onlineRegister() {
     await postAuthRedirect();
   } catch (err) {
     error.value = err.detail || 'Registration failed';
+  }
+}
+
+async function guestLogin() {
+  if (guestLoading.value || !guestName.value.trim()) return;
+  error.value = '';
+  guestLoading.value = true;
+  try {
+    await apiPost('/auth/guest', { username: guestName.value.trim() });
+    await fetchMe();
+    await postAuthRedirect();
+  } catch (err) {
+    error.value = err.detail || 'Could not join as a guest';
+  } finally {
+    guestLoading.value = false;
   }
 }
 </script>

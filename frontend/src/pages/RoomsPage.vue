@@ -27,7 +27,7 @@
               />
               <button type="submit" class="btn btn-secondary">Join</button>
             </form>
-            <button class="btn btn-primary" @click="handleCreateRoom">
+            <button v-if="!isGuest" class="btn btn-primary" @click="handleCreateRoom">
               <i class="ph ph-plus"></i> Create Room
             </button>
           </div>
@@ -74,7 +74,7 @@
         />
         <p v-if="otherRooms.length === 0" class="empty-state">
           <i class="ph ph-music-notes"></i>
-          <span>No rooms available. Create one!</span>
+          <span>{{ isGuest ? 'No rooms available. Ask the host for a room code or invite.' : 'No rooms available. Create one!' }}</span>
         </p>
       </section>
 
@@ -242,7 +242,7 @@ import PaginationControls from '../components/PaginationControls.vue';
 import AdmissionPrompt from '../components/AdmissionPrompt.vue';
 
 const router = useRouter();
-const { username, userId, hasPassword, setHasPassword, fetchMe, logout } = useAuth();
+const { username, userId, hasPassword, setHasPassword, fetchMe, logout, isGuest } = useAuth();
 const { showToast } = useToast();
 const { admission, busy: admissionBusy, error: admissionError, join: requestJoin, checkStatus: checkAdmission, cancel: cancelAdmission } = useRoomAdmission();
 const canManageConnection = ref(false);
@@ -303,6 +303,10 @@ onMounted(async () => {
     // continue
   }
   try {
+    if (isGuest.value) {
+      await loadRooms();
+      return;
+    }
     const { can_manage } = await apiGet('/platform-connections/spotify/access');
     canManageConnection.value = can_manage;
   } catch {
@@ -424,6 +428,7 @@ async function submitPin() {
 }
 
 function handleCreateRoom() {
+  if (isGuest.value) return;
   if (!hasPassword.value) {
     showPasswordModal.value = true;
     return;

@@ -68,7 +68,11 @@ const router = createRouter({
 });
 
 router.beforeEach((to) => {
-  const { isAuthenticated } = useAuth();
+  const { isAuthenticated, isGuest } = useAuth();
+
+  if (isGuest.value && ['/connection', '/complete-profile'].includes(to.path)) {
+    return '/rooms';
+  }
 
   const returnPage = sessionStorage.getItem('spotify_return_page');
   if (returnPage && isAuthenticated.value && to.path !== returnPage) {

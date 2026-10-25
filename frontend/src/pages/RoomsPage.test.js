@@ -7,10 +7,14 @@ const mocks = vi.hoisted(() => ({
   apiPost: vi.fn(),
   push: vi.fn(),
   showToast: vi.fn(),
+  isGuest: null,
 }));
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: mocks.push }) }));
 vi.mock('../composables/useApi.js', () => ({ apiGet: mocks.apiGet, apiPost: mocks.apiPost }));
-vi.mock('../composables/useAuth.js', () => ({
+vi.mock('../composables/useAuth.js', async () => {
+  const { ref } = await import('vue');
+  mocks.isGuest = ref(false);
+  return {
   useAuth: () => ({
     userId: { value: 'new-user' },
     username: { value: 'New user' },
@@ -18,8 +22,10 @@ vi.mock('../composables/useAuth.js', () => ({
     fetchMe: async () => ({ id: 'new-user', room_id: null }),
     logout: vi.fn(),
     setHasPassword: vi.fn(),
+    isGuest: mocks.isGuest,
   }),
-}));
+};
+});
 vi.mock('../composables/useToast.js', () => ({ useToast: () => ({ showToast: mocks.showToast }) }));
 vi.mock('../components/ThemeToggle.vue', () => ({ default: { template: '<span />' } }));
 vi.mock('../components/PaginationControls.vue', () => ({ default: { template: '<span />' } }));
@@ -28,6 +34,7 @@ let wrapper;
 let room;
 beforeEach(() => {
   vi.clearAllMocks();
+  mocks.isGuest.value = false;
   room = { id: 'room', room_name: 'Music room', host_user_id: 'host', is_private: false };
   mocks.apiGet.mockImplementation(async (path) => {
     if (path === '/rooms/') return [room];
@@ -45,6 +52,17 @@ async function renderRooms() {
 }
 
 describe('room admission entry points', () => {
+  it('lets a guest join immediately without room creation or Spotify connection controls', async () => {
+    mocks.isGuest.value = true;
+    mocks.apiPost.mockResolvedValue({ room_id: 'room', status: 'joined' });
+    await renderRooms();
+    expect(wrapper.text()).not.toContain('Create Room');
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/platform-connections/spotify/access');
+    await wrapper.get('.room-card .btn-primary').trigger('click');
+    await flushPromises();
+    expect(wrapper.find('.admission-prompt').exists()).toBe(false);
+    expect(mocks.push).toHaveBeenCalledWith('/room/room');
+  });
   it('keeps new users outside and displays instructions after a validated request', async () => {
     await renderRooms();
     await wrapper.get('.room-card .btn-primary').trigger('click');

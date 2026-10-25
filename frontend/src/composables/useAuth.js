@@ -6,6 +6,7 @@ const API_BASE = '/api/v1';
 // cannot read (XSS-resistant); identity is derived from GET /auth/me instead.
 const user = ref(null);
 const ready = ref(false);
+const serverClockOffset = ref(0);
 
 export function clearAuth() {
   user.value = null;
@@ -26,6 +27,8 @@ export async function fetchMe() {
     });
     if (response.ok) {
       user.value = await response.json();
+      const serverDate = Date.parse(response.headers?.get?.('Date'));
+      if (Number.isFinite(serverDate)) serverClockOffset.value = serverDate - Date.now();
     } else {
       user.value = null;
     }
@@ -44,6 +47,8 @@ export function useAuth() {
   const userId = computed(() => user.value?.id || null);
   const publicId = computed(() => user.value?.public_id || '');
   const avatarUrl = computed(() => user.value?.avatar_url || null);
+  const isGuest = computed(() => !!user.value?.is_guest);
+  const guestRequestAvailableAt = computed(() => user.value?.guest_request_available_at || null);
 
   function setHasPassword(value) {
     if (user.value) {
@@ -78,6 +83,9 @@ export function useAuth() {
     userId,
     publicId,
     avatarUrl,
+    isGuest,
+    guestRequestAvailableAt,
+    serverClockOffset,
     fetchMe,
     setHasPassword,
     setAvatarUrl,
