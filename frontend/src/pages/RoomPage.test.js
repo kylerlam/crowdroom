@@ -44,6 +44,7 @@ let pending;
 let authorized;
 let devices;
 let selectedDeviceId;
+let admissions;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -54,11 +55,13 @@ beforeEach(() => {
   authorized = true;
   devices = [{ id: 'desktop', name: 'Desktop', type: 'computer', is_active: true, is_restricted: false }];
   selectedDeviceId = 'desktop';
+  admissions = [];
   mocks.apiGet.mockImplementation(async (path) => {
     if (path === '/playback/spotify/status') return { authorized };
     if (path === '/playback/devices') return { devices, selected_device_id: selectedDeviceId };
     if (path === '/platform-connections/spotify/has-app-credentials') return { has_credentials: true };
     if (path === '/rooms/room') return room;
+    if (path === '/rooms/room/admissions') return admissions;
     if (path === '/session/by-room/room') return { id: 'session' };
     if (path === '/rooms/room/playback') return { status: 'stopped' };
     if (path === '/queue/current?session_id=session') return null;
@@ -82,6 +85,56 @@ async function renderRoom() {
 }
 
 describe('room administrator controls', () => {
+  it('lets managers approve pending members and refreshes requests from targeted events', async () => {
+    mocks.userId.value = 'admin';
+    admissions = [{ user_id: 'new-member', username: 'New member', status: 'pending' }];
+    await renderRoom();
+    expect(wrapper.find('[aria-label="Approve New member"]').exists()).toBe(true);
+    mocks.apiPatch.mockImplementation(async () => { admissions = []; });
+    await wrapper.get('[aria-label="Approve New member"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiPatch).toHaveBeenCalledWith('/rooms/room/admissions/new-member', { approved: true });
+    expect(wrapper.find('[aria-label="Approve New member"]').exists()).toBe(false);
+    admissions = [{ user_id: 'other', username: 'Other member', status: 'pending' }];
+    await mocks.handlers.get('admission_requested')({});
+    await flushPromises();
+    expect(wrapper.find('[aria-label="Deny Other member"]').exists()).toBe(true);
+  });
+
+  it('keeps admission requests private from ordinary members', async () => {
+    mocks.userId.value = 'guest';
+    await renderRoom();
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/rooms/room/admissions');
+    expect(wrapper.find('.admissions-panel').exists()).toBe(false);
+  });
+
+  it('lets managers recover an accidentally declined request without denying it twice', async () => {
+    mocks.userId.value = 'admin';
+    admissions = [{ user_id: 'declined', username: 'Declined member', status: 'rejected' }];
+    await renderRoom();
+    expect(wrapper.get('.admissions-panel .badge').text()).toBe('0');
+    expect(wrapper.get('.admissions-panel .members-list').text()).toContain('Declined');
+    expect(wrapper.find('[aria-label="Deny Declined member"]').exists()).toBe(false);
+    mocks.apiPatch.mockImplementation(async () => { admissions = []; });
+    await wrapper.get('[aria-label="Approve Declined member"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiPatch).toHaveBeenCalledWith('/rooms/room/admissions/declined', { approved: true });
+    expect(wrapper.find('[aria-label="Approve Declined member"]').exists()).toBe(false);
+  });
+
+  it('refreshes a stale request if another manager already approved the account', async () => {
+    admissions = [{ user_id: 'new-member', username: 'New member', status: 'pending' }];
+    await renderRoom();
+    mocks.apiPatch.mockImplementation(async () => {
+      admissions = [];
+      throw { status: 403, detail: 'This account is already approved. Use Ban to block room access.' };
+    });
+    await wrapper.get('[aria-label="Deny New member"]').trigger('click');
+    await flushPromises();
+    expect(mocks.showToast).toHaveBeenCalledWith('This account is already approved. Use Ban to block room access.');
+    expect(wrapper.find('[aria-label="Deny New member"]').exists()).toBe(false);
+  });
+
   it('lets only the owner promote and revoke administrators', async () => {
     await renderRoom();
     mocks.apiPatch.mockResolvedValue({ ...room, admin_user_ids: ['admin', 'guest'] });
@@ -117,14 +170,14 @@ describe('idle playback recovery', () => {
     await renderRoom();
     const status = wrapper.get('[aria-label="Spotify disconnected"]');
     expect(status.attributes('data-tooltip')).toBe('Disconnected');
-    expect(status.attributes('href')).toBe('/profile');
+    expect(status.attributes('href')).toBe('/connection');
     expect(status.attributes('target')).toBe('_blank');
     expect(wrapper.find('#spotify-authorization-required').exists()).toBe(false);
     expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
     expect(wrapper.get('input[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
   });
 
-  it('refreshes authorization when returning from the profile tab', async () => {
+  it('refreshes authorization when returning from the connection tab', async () => {
     authorized = false;
     await renderRoom();
     authorized = true;
@@ -175,7 +228,7 @@ describe('idle playback recovery', () => {
     await renderRoom();
     await wrapper.get('[title="Resume playback"]').trigger('click');
     await flushPromises();
-    expect(mocks.apiPost).toHaveBeenCalledWith('/playback/play', {});
+    expect(mocks.apiPost).toHaveBeenCalledWith('/playback/play', { song_id: 'song' });
   });
 
   it('disables resume for ordinary members', async () => {
@@ -281,7 +334,11 @@ describe('Spotify manager status and devices', () => {
     expect(mocks.apiGet).toHaveBeenCalledWith('/playback/spotify/status');
     expect(mocks.apiGet).not.toHaveBeenCalledWith('/platform-connections/');
     expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
-    expect(wrapper.get('a[href="/profile"]').text()).toBe('Profile');
+    expect(wrapper.get('a[aria-label="Profile"] .ph-user-circle').exists()).toBe(true);
+    expect(wrapper.get('.spotify-status').element.tagName).toBe('SPAN');
+    expect(wrapper.find('.spotify-status[href]').exists()).toBe(false);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/devices');
   });
 
   it('does not request or reveal Spotify status and devices to ordinary members', async () => {
@@ -305,7 +362,7 @@ describe('Spotify manager status and devices', () => {
     expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
   });
 
-  it('lets managers select an available playback device without requesting play', async () => {
+  it('lets the host select an available playback device without requesting play', async () => {
     devices.push({ id: 'speaker', name: 'Speaker', type: 'speaker', is_active: false, is_restricted: false });
     devices.push({ id: 'restricted', name: 'Restricted', type: 'speaker', is_active: false, is_restricted: true });
     await renderRoom();

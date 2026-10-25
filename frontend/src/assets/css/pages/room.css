@@ -208,7 +208,8 @@
   transform: none;
 }
 
-.room-header .icon-tooltip::after {
+.room-header .icon-tooltip::after,
+.app-header .icon-tooltip::after {
   bottom: auto;
   top: calc(100% + var(--space-2));
 }
@@ -371,6 +372,15 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.admissions-panel .member-name {
+  flex: 1;
+}
+
+.admissions-panel .btn {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--font-size-sm);
 }
 
 .member-action-btn {

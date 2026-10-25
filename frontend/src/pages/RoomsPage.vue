@@ -3,18 +3,15 @@
     <header class="app-header">
       <h2>CrowdRoom</h2>
       <div class="header-actions">
-        <router-link to="/profile" class="avatar-link" title="Profile">
-          <img v-if="avatarUrl" :src="avatarUrl" class="nav-avatar" alt="avatar" />
-          <span v-else class="nav-avatar nav-avatar-fallback">{{
-            (username || '?')[0].toUpperCase()
-          }}</span>
-        </router-link>
+        <router-link to="/profile" class="btn btn-ghost btn-icon icon-tooltip" aria-label="Profile" data-tooltip="Profile"><i class="ph ph-user-circle" aria-hidden="true"></i></router-link>
+        <router-link v-if="canManageConnection" to="/connection" class="btn btn-ghost btn-icon icon-tooltip" aria-label="Connection" data-tooltip="Connection"><i class="ph ph-link" aria-hidden="true"></i></router-link>
         <ThemeToggle />
         <button class="btn btn-ghost" @click="handleLogout">Logout</button>
       </div>
     </header>
 
     <main class="container">
+      <AdmissionPrompt v-if="admission" :request="admission" :busy="admissionBusy" :error="admissionError" @check="checkAdmission" @cancel="cancelAdmission" />
       <section class="rooms-section">
         <div class="section-header">
           <h3>Rooms</h3>
@@ -239,12 +236,16 @@ import { apiGet, apiPost } from '../composables/useApi.js';
 import { useAuth } from '../composables/useAuth.js';
 import { useToast } from '../composables/useToast.js';
 import { usePagination } from '../composables/usePagination.js';
+import { useRoomAdmission } from '../composables/useRoomAdmission.js';
 import ThemeToggle from '../components/ThemeToggle.vue';
 import PaginationControls from '../components/PaginationControls.vue';
+import AdmissionPrompt from '../components/AdmissionPrompt.vue';
 
 const router = useRouter();
-const { username, userId, hasPassword, avatarUrl, setHasPassword, fetchMe, logout } = useAuth();
+const { username, userId, hasPassword, setHasPassword, fetchMe, logout } = useAuth();
 const { showToast } = useToast();
+const { admission, busy: admissionBusy, error: admissionError, join: requestJoin, checkStatus: checkAdmission, cancel: cancelAdmission } = useRoomAdmission();
+const canManageConnection = ref(false);
 
 const rooms = ref([]);
 const showCreateModal = ref(false);
@@ -301,6 +302,12 @@ onMounted(async () => {
   } catch {
     // continue
   }
+  try {
+    const { can_manage } = await apiGet('/platform-connections/spotify/access');
+    canManageConnection.value = can_manage;
+  } catch {
+    // Leave the connection entry hidden until the server confirms access.
+  }
   await loadRooms();
 });
 
@@ -322,6 +329,7 @@ async function handleLogout() {
 }
 
 async function handleJoin(room) {
+  if (admissionBusy.value) return;
   if (room.is_private) {
     joinTargetRoomId.value = room.id;
     showPinModal.value = true;
@@ -337,8 +345,7 @@ async function joinRoom(targetRoomId, pin) {
   try {
     const body = {};
     if (pin) body.pin = pin;
-    await apiPost(`/rooms/${targetRoomId}/join`, body);
-    router.push(`/room/${targetRoomId}`);
+    await requestJoin(targetRoomId, `/rooms/${targetRoomId}/join`, body);
     return { ok: true };
   } catch (err) {
     return {
@@ -399,7 +406,7 @@ async function submitPin() {
     closePinModal();
     return;
   }
-  if (result.status === 403) {
+  if (result.status === 403 && /pin/i.test(result.detail || '')) {
     pinError.value = 'The PIN you entered is not valid';
     joinPin.value = '';
     startPinCooldown(Math.ceil(PIN_COOLDOWN_MS / 1000));

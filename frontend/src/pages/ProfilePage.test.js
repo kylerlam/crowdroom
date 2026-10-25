@@ -2,59 +2,39 @@ import { mount, flushPromises } from '@vue/test-utils';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ProfilePage from './ProfilePage.vue';
 
-const mocks = vi.hoisted(() => ({ apiGet: vi.fn(), apiPost: vi.fn(), apiDelete: vi.fn() }));
+const mocks = vi.hoisted(() => ({ apiPost: vi.fn(), apiGet: vi.fn() }));
 vi.mock('vue-router', () => ({ useRouter: () => ({ push: vi.fn() }) }));
 vi.mock('../components/ThemeToggle.vue', () => ({ default: { template: '<span />' } }));
 vi.mock('../composables/useAuth.js', () => ({
   useAuth: () => ({ username: 'kyler', avatarUrl: null, setAvatarUrl: vi.fn() }),
 }));
 vi.mock('../composables/useToast.js', () => ({ useToast: () => ({ showToast: vi.fn() }) }));
-vi.mock('../composables/useApi.js', () => ({
-  apiGet: mocks.apiGet, apiPost: mocks.apiPost, apiDelete: mocks.apiDelete,
-}));
+vi.mock('../composables/useApi.js', () => ({ apiPost: mocks.apiPost, apiGet: mocks.apiGet }));
 
 let wrapper;
-let connections;
-beforeEach(() => {
-  vi.clearAllMocks();
-  connections = [{ platform: 'spotify', connection_type: 'client_credentials', token_expires_at: null }];
-  mocks.apiGet.mockImplementation(async (path) => path === '/platform-connections/'
-    ? connections : { has_credentials: true });
-});
+beforeEach(() => vi.clearAllMocks());
 afterEach(() => wrapper?.unmount());
 
-async function renderProfile() {
-  wrapper = mount(ProfilePage);
-  await flushPromises();
-}
-
-describe('Spotify account connection status', () => {
-  it('does not label app credentials as a connected playback account', async () => {
-    await renderProfile();
-    expect(wrapper.find('.connection-status.connected').exists()).toBe(false);
-    expect(wrapper.text()).toContain('Not connected');
-    expect(wrapper.text()).toContain('Authorize your Spotify account');
-    expect(wrapper.findAll('button').some((button) => button.text() === 'Connect Spotify')).toBe(true);
-  });
-
-  it('recognizes OAuth with an expired access token as refreshable', async () => {
-    connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: '2020-01-01T00:00:00' }];
-    await renderProfile();
-    expect(wrapper.get('.connection-status.connected').text()).toBe('Connected');
-  });
-
-  it('requires authorization when an OAuth row has no issued token', async () => {
-    connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: null }];
-    await renderProfile();
-    expect(wrapper.find('.connection-status.connected').exists()).toBe(false);
-  });
-
-  it('keeps configured app credentials usable after disconnecting an account', async () => {
-    connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: '2099-01-01T00:00:00' }];
-    await renderProfile();
-    mocks.apiDelete.mockImplementation(async () => { connections = []; });
-    await wrapper.findAll('button').find((button) => button.text() === 'Disconnect').trigger('click');
+describe('personal profile', () => {
+  it('shows personal settings without loading or rendering Spotify connections', async () => {
+    wrapper = mount(ProfilePage);
     await flushPromises();
-    expect(wrapper.findAll('button').some((button) => button.text() === 'Connect Spotify')).toBe(true);
+    expect(wrapper.text()).toContain('Password');
+    expect(wrapper.find('[aria-label="Change avatar"]').exists()).toBe(true);
+    expect(wrapper.text()).not.toContain('Spotify');
+    expect(mocks.apiGet).not.toHaveBeenCalled();
+  });
+
+  it('keeps password updates on the profile page', async () => {
+    wrapper = mount(ProfilePage);
+    await wrapper.get('#current-password').setValue('current-password');
+    await wrapper.get('#new-password').setValue('replacement-password');
+    await wrapper.get('#confirm-password').setValue('replacement-password');
+    await wrapper.get('form').trigger('submit');
+    await flushPromises();
+    expect(mocks.apiPost).toHaveBeenCalledWith('/auth/change-password', {
+      current_password: 'current-password', new_password: 'replacement-password',
+    });
+    expect(wrapper.text()).toContain('Password changed');
   });
 });

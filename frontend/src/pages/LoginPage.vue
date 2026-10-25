@@ -152,14 +152,8 @@ onMounted(async () => {
 
 async function postAuthRedirect() {
   if (inviteToken.value) {
-    try {
-      const join = await apiPost(`/rooms/invite/${inviteToken.value}/join`);
-      router.push(`/room/${join.room_id}`);
-      return;
-    } catch (err) {
-      error.value = err.detail || 'Failed to join invite';
-      return;
-    }
+    router.push({ path: '/invite', query: { token: inviteToken.value, join: '1' } });
+    return;
   }
   router.push('/rooms');
 }

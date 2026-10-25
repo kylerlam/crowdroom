@@ -4,10 +4,12 @@
       <h2 :title="roomName">{{ roomName }}</h2>
       <div class="header-actions">
         <span class="badge">{{ roomCode }}</span>
-        <a href="/profile" target="_blank" rel="noopener" class="btn btn-ghost">Profile</a>
+        <a href="/profile" target="_blank" rel="noopener" class="btn btn-ghost btn-icon icon-tooltip" aria-label="Profile" data-tooltip="Profile">
+          <i class="ph ph-user-circle" aria-hidden="true"></i>
+        </a>
         <a
-          v-if="isManager && spotifyConnectionKnown"
-          href="/profile"
+          v-if="isHost && spotifyConnectionKnown"
+          href="/connection"
           target="_blank"
           rel="noopener"
           class="btn btn-ghost btn-icon icon-tooltip spotify-status"
@@ -17,6 +19,15 @@
         >
           <i :class="spotifyPlaybackRequired ? 'ph ph-link-break' : 'ph ph-link'" aria-hidden="true"></i>
         </a>
+        <span
+          v-else-if="isManager && spotifyConnectionKnown"
+          class="btn btn-ghost btn-icon icon-tooltip spotify-status"
+          :class="{ connected: !spotifyPlaybackRequired }"
+          :aria-label="spotifyPlaybackRequired ? 'Spotify disconnected' : 'Spotify connected'"
+          :data-tooltip="spotifyPlaybackRequired ? 'Disconnected' : 'Connected'"
+          role="img"
+          tabindex="0"
+        ><i :class="spotifyPlaybackRequired ? 'ph ph-link-break' : 'ph ph-link'" aria-hidden="true"></i></span>
         <button
           v-if="isHost"
           class="btn btn-ghost btn-icon"
@@ -86,7 +97,7 @@
             </button>
           </div>
         </div>
-        <details v-if="isManager && spotifyConnectionKnown && !spotifyPlaybackRequired" class="spotify-device-panel" @toggle="onDevicesToggle">
+        <details v-if="isHost && spotifyConnectionKnown && !spotifyPlaybackRequired" class="spotify-device-panel" @toggle="onDevicesToggle">
           <summary><i class="ph ph-speaker-high" aria-hidden="true"></i> Playback device</summary>
           <div class="spotify-device-controls">
             <label for="spotify-device">Spotify device</label>
@@ -177,9 +188,7 @@
           <div v-if="spotifyBanner" class="empty-state">
             <i class="ph ph-spotify-logo"></i>
             <p>{{ spotifyBanner.message }}</p>
-            <router-link to="/profile" class="btn btn-primary" style="margin-top: var(--space-3)"
-              >Set up in Profile</router-link
-            >
+            <a v-if="isHost" href="/connection" target="_blank" rel="noopener" class="btn btn-primary" style="margin-top: var(--space-3)">Set up Spotify</a>
           </div>
           <div class="search-input-wrapper">
             <i class="ph ph-magnifying-glass"></i>
@@ -274,6 +283,28 @@
               </span>
             </li>
           </ul>
+        </details>
+      </aside>
+
+      <!-- Join requests -->
+      <aside v-if="isManager" class="panel members-panel admissions-panel">
+        <details @toggle="onAdmissionsToggle">
+          <summary>
+            <h3><i class="ph ph-user-plus"></i> Join requests <span class="badge">{{ admissions.filter(request => request.status === 'pending').length }}</span></h3>
+          </summary>
+          <p v-if="admissionError" class="error-text" role="status">{{ admissionError }}</p>
+          <p v-if="!admissions.length" class="text-secondary">No pending requests.</p>
+          <ul class="members-list">
+            <li v-for="request in admissions" :key="request.user_id" class="member-item">
+              <span class="member-name">{{ request.username }}</span>
+              <span v-if="request.status === 'rejected'" class="badge">Declined</span>
+              <span class="member-actions">
+                <button class="btn btn-secondary" :aria-label="`Approve ${request.username}`" :disabled="admissionBusyIds.has(request.user_id)" @click="reviewAdmission(request, true)">Approve</button>
+                <button v-if="request.status === 'pending'" class="btn btn-ghost" :aria-label="`Deny ${request.username}`" :disabled="admissionBusyIds.has(request.user_id)" @click="reviewAdmission(request, false)">Deny</button>
+              </span>
+            </li>
+          </ul>
+          <button class="btn btn-ghost" @click="loadAdmissions">Refresh requests</button>
         </details>
       </aside>
 
@@ -488,6 +519,9 @@ const queueBusyIds = ref(new Set());
 const pinnedCount = computed(() => queueItems.value.filter((item) => item.is_pinned).length);
 const members = ref([]);
 const bannedUsers = ref([]);
+const admissions = ref([]);
+const admissionError = ref('');
+const admissionBusyIds = ref(new Set());
 const history = ref([]);
 const searchQuery = ref('');
 const searchResults = ref([]);
@@ -562,7 +596,7 @@ onMounted(async () => {
     await loadRoom();
     await loadSession();
     await syncPlaybackPosition();
-    await Promise.all([loadCurrentSong(), loadMembers(), loadHistory()]);
+    await Promise.all([loadCurrentSong(), loadMembers(), loadHistory(), loadAdmissions()]);
     await loadQueue();
     if (isPlaying.value && !currentSong.value && currentExternalId) {
       await loadExternalTrack();
@@ -748,6 +782,38 @@ async function loadCurrentSong() {
   currentSong.value = item?.song ? item : null;
 }
 
+function onAdmissionsToggle(event) {
+  if (event.target.open) loadAdmissions();
+}
+
+async function loadAdmissions() {
+  if (!isManager.value) return;
+  admissionError.value = '';
+  try {
+    const requests = await apiGet(`/rooms/${roomId.value}/admissions`);
+    if (isManager.value) admissions.value = requests;
+  } catch (err) {
+    admissionError.value = err.detail || 'Could not load join requests.';
+  }
+}
+
+async function reviewAdmission(request, approved) {
+  if (!isManager.value || admissionBusyIds.value.has(request.user_id)) return;
+  admissionBusyIds.value = new Set(admissionBusyIds.value).add(request.user_id);
+  try {
+    await apiPatch(`/rooms/${roomId.value}/admissions/${request.user_id}`, { approved });
+    await loadAdmissions();
+    showToast(approved ? 'Join request approved' : 'Join request denied', 'success');
+  } catch (err) {
+    showToast(err.detail || 'Could not review join request');
+    if (err.status === 403) await loadAdmissions();
+  } finally {
+    const next = new Set(admissionBusyIds.value);
+    next.delete(request.user_id);
+    admissionBusyIds.value = next;
+  }
+}
+
 function stripCurrentSongFromQueue(items) {
   if (!items || items.length === 0) return [];
   const first = items[0];
@@ -911,10 +977,10 @@ async function checkSpotifyConnection() {
     if (isHost.value) {
       const { has_credentials } = await apiGet('/platform-connections/spotify/has-app-credentials');
       spotifyBanner.value = has_credentials ? null : {
-        message: 'Set up Spotify in your profile to enable search',
+        message: 'Set up Spotify in Connection to enable search',
       };
     }
-    if (authorized) await loadSpotifyDevices();
+    if (authorized && isHost.value) await loadSpotifyDevices();
   } catch {
     // Keep the last known status when Spotify is temporarily unavailable.
   }
@@ -929,7 +995,7 @@ function onDevicesToggle(event) {
 }
 
 async function loadSpotifyDevices() {
-  if (!isManager.value || spotifyPlaybackRequired.value || devicesLoading.value) return;
+  if (!isHost.value || spotifyPlaybackRequired.value || devicesLoading.value) return;
   devicesLoading.value = true;
   deviceError.value = '';
   try {
@@ -949,7 +1015,7 @@ async function loadSpotifyDevices() {
 }
 
 async function selectSpotifyDevice() {
-  if (!isManager.value || !selectedDeviceId.value || deviceSelecting.value) return;
+  if (!isHost.value || !selectedDeviceId.value || deviceSelecting.value) return;
   deviceSelecting.value = true;
   try {
     await apiPut('/playback/device', { device_id: selectedDeviceId.value });
@@ -1074,7 +1140,7 @@ async function resumePlayback() {
   }
   resuming.value = true;
   try {
-    await apiPost('/playback/play', {});
+    await apiPost('/playback/play', { song_id: queueItems.value[0].song.id });
     await loadCurrentSong();
     await loadPlaybackState();
     await loadQueue();
@@ -1182,12 +1248,18 @@ function setupWebSocket() {
   register('admins_updated', (msg) => {
     const wasManager = isManager.value;
     adminUserIds.value = msg.payload?.admin_user_ids || [];
-    if (!wasManager && isManager.value) checkSpotifyConnection();
+    if (!wasManager && isManager.value) {
+      checkSpotifyConnection();
+      loadAdmissions();
+    }
     if (!isManager.value) {
       spotifyConnectionKnown.value = false;
       spotifyDevices.value = [];
+      admissions.value = [];
     }
   });
+  register('admission_requested', loadAdmissions);
+  register('admission_updated', loadAdmissions);
   register('oauth_required', () => {
     if (isManager.value) {
       spotifyPlaybackRequired.value = true;

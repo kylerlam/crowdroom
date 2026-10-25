@@ -21,6 +21,12 @@ const routes = [
     meta: { requiresAuth: true },
   },
   {
+    path: '/connection',
+    name: 'Connection',
+    component: () => import('../pages/ConnectionPage.vue'),
+    meta: { requiresAuth: true },
+  },
+  {
     path: '/rooms',
     name: 'Rooms',
     component: () => import('../pages/RoomsPage.vue'),
