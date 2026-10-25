@@ -1,14 +1,20 @@
 """Service for managing user platform connections."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
+from weakref import WeakValueDictionary
+
+import httpx
 
 from backend.adapters.spotify_auth_adapter import SpotifyAuthAdapter
 from backend.core.config import settings
 from backend.core.encryption import decrypt_data, encrypt_data
 from backend.core.exceptions import (
     EntityNotFoundException,
+    InvalidPlatformCredentialsException,
     SpotifyConnectionRequiredException,
+    SpotifyUpstreamException,
 )
 from backend.db.models import PlatformConnection, StreamingPlatforms
 from backend.db.models.enum import ConnectionType
@@ -17,6 +23,20 @@ from backend.schemas.platform_connection import (
     CreatePlatformConnection,
     StoreOAuthTokens,
 )
+
+_refresh_locks: WeakValueDictionary[tuple[UUID, StreamingPlatforms], asyncio.Lock] = (
+    WeakValueDictionary()
+)
+
+
+def _refresh_lock(user_id: UUID, platform: StreamingPlatforms) -> asyncio.Lock:
+    """Serialize refreshes across request services in the single app process."""
+    key = (user_id, platform)
+    lock = _refresh_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _refresh_locks[key] = lock
+    return lock
 
 
 class PlatformConnectionService:
@@ -47,6 +67,11 @@ class PlatformConnectionService:
 
         existing = self._repo.get_by_user_and_platform(user_id, data.platform)
         if existing:
+            previous = self.get_spotify_app_credentials(user_id)
+            if previous and previous.get("client_id") != data.credentials.get(
+                "client_id"
+            ):
+                self._clear_oauth(existing)
             existing.credentials_encrypted = encrypt_data(data.credentials)
             return self._repo.update(existing)
 
@@ -166,20 +191,21 @@ class PlatformConnectionService:
         Raises:
             SpotifyConnectionRequiredException: If account authorization is missing.
         """
-        connection = self._get_oauth_connection(user_id, platform)
+        async with _refresh_lock(user_id, platform):
+            connection = self._get_oauth_connection(user_id, platform)
 
-        buffer = timedelta(minutes=5)
-        now = datetime.now(timezone.utc).replace(tzinfo=None)
+            buffer = timedelta(minutes=5)
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
 
-        expires_at = connection.token_expires_at
-        if expires_at and expires_at.tzinfo is not None:
-            expires_at = expires_at.replace(tzinfo=None)
+            expires_at = connection.token_expires_at
+            if expires_at and expires_at.tzinfo is not None:
+                expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
 
-        if not expires_at or expires_at - now < buffer:
-            return await self._refresh_access_token(connection)
+            if not expires_at or expires_at - now < buffer:
+                return await self._refresh_access_token(connection)
 
-        token_data = decrypt_data(connection.access_token_encrypted)
-        return token_data["access_token"]
+            token_data = decrypt_data(connection.access_token_encrypted)
+            return token_data["access_token"]
 
     async def force_refresh_token(
         self, user_id: UUID, platform: StreamingPlatforms
@@ -196,8 +222,26 @@ class PlatformConnectionService:
         Raises:
             SpotifyConnectionRequiredException: If account authorization is missing.
         """
-        connection = self._get_oauth_connection(user_id, platform)
-        return await self._refresh_access_token(connection)
+        async with _refresh_lock(user_id, platform):
+            connection = self._get_oauth_connection(user_id, platform)
+            return await self._refresh_access_token(connection)
+
+    def is_spotify_authorized(self, user_id: UUID) -> bool:
+        """Report stored user authorization, including tokens that can be renewed."""
+        try:
+            self._get_oauth_connection(user_id, StreamingPlatforms.SPOTIFY)
+        except SpotifyConnectionRequiredException:
+            return False
+        return True
+
+    @staticmethod
+    def _clear_oauth(connection: PlatformConnection) -> None:
+        """Discard authorization only when revoked or bound to a different app."""
+        connection.access_token_encrypted = None
+        connection.refresh_token_encrypted = None
+        connection.token_expires_at = None
+        connection.scopes = None
+        connection.connection_type = ConnectionType.CLIENT_CREDENTIALS
 
     def _get_oauth_connection(
         self, user_id: UUID, platform: StreamingPlatforms
@@ -250,21 +294,37 @@ class PlatformConnectionService:
         refresh_token = refresh_data["refresh_token"]
         client_id, client_secret = self._resolve_app_credentials(connection)
 
-        import httpx
-
         async with httpx.AsyncClient() as client:
-            response = await client.post(
-                url="https://accounts.spotify.com/api/token",
-                data={
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                    "client_id": client_id,
-                    "client_secret": client_secret,
-                },
-            )
-            if response.status_code in (400, 401):
-                raise SpotifyConnectionRequiredException()
-            response.raise_for_status()
+            try:
+                response = await client.post(
+                    url="https://accounts.spotify.com/api/token",
+                    data={
+                        "grant_type": "refresh_token",
+                        "refresh_token": refresh_token,
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                    },
+                )
+            except httpx.RequestError as exc:
+                raise SpotifyUpstreamException(
+                    503,
+                    "Spotify authorization could not be renewed. Try again shortly.",
+                ) from exc
+            if response.is_error:
+                try:
+                    error = response.json().get("error")
+                except ValueError:
+                    error = None
+                if error == "invalid_grant":
+                    self._clear_oauth(connection)
+                    self._repo.update(connection)
+                    raise SpotifyConnectionRequiredException()
+                if error == "invalid_client":
+                    raise InvalidPlatformCredentialsException("Spotify app")
+                raise SpotifyUpstreamException(
+                    response.status_code,
+                    "Spotify authorization could not be renewed. Try again shortly.",
+                )
             token_response = response.json()
 
         new_access_token = token_response["access_token"]

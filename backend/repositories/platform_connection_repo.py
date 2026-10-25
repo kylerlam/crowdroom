@@ -60,10 +60,12 @@ class PlatformConnectionRepo:
             PlatformConnection if found, None otherwise.
         """
         return self._session.exec(
-            select(PlatformConnection).where(
+            select(PlatformConnection)
+            .where(
                 PlatformConnection.user_id == user_id,
                 PlatformConnection.platform == platform,
             )
+            .execution_options(populate_existing=True)
         ).first()
 
     def get_all_by_user(self, user_id: UUID) -> list[PlatformConnection]:

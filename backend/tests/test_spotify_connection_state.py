@@ -6,6 +6,7 @@ from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import anyio
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session as DBSession
@@ -151,7 +152,7 @@ def test_revoked_refresh_authorization_requires_reconnect():
     repo.get_by_user_and_platform.return_value = connection
     service = PlatformConnectionService(repo)
     client = AsyncMock()
-    client.post.return_value = MagicMock(status_code=400)
+    client.post.return_value = httpx.Response(400, json={"error": "invalid_grant"})
     with patch("httpx.AsyncClient") as client_type:
         client_type.return_value.__aenter__.return_value = client
 
