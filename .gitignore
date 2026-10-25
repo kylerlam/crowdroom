@@ -211,3 +211,6 @@ __marimo__/
 
 # Db
 *.db
+
+# Local development instructions
+docs/
