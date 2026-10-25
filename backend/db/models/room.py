@@ -43,6 +43,11 @@ class Room(SQLModel, table=True):
         default_factory=dict, sa_column=Column(JSON, nullable=False)
     )
 
+    @property
+    def admin_user_ids(self) -> list[UUID]:
+        """Return the room's delegated administrators."""
+        return [UUID(user_id) for user_id in self.settings.get("admin_user_ids", [])]
+
     # Relations
     users: Mapped[list["User"]] = Relationship(
         back_populates="room",

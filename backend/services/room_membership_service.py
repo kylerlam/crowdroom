@@ -157,6 +157,10 @@ class RoomMembershipService:
             raise EntityNotFoundException("Room membership")
         room_id = user.room_id
         room = self._room_service.get_room(room_id)
+        if user.id in room.admin_user_ids:
+            await self._room_service.set_admin(
+                room_id, room.host_user_id, user.id, False
+            )
         user.room_id = None
         self._user_repo.save(user)
 

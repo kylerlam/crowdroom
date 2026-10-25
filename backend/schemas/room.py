@@ -89,6 +89,9 @@ class ReadRoom(BaseModel):
 
     id: UUID = Field(..., description="Room's ID.")
     host_user_id: UUID = Field(..., description="Host's user ID.")
+    admin_user_ids: list[UUID] = Field(
+        default_factory=list, description="Users delegated to manage this room."
+    )
     room_name: str = Field(..., description="Room's name.")
     is_private: bool = Field(
         ..., description="Whether if the room is private or public."
@@ -152,6 +155,12 @@ class JoinRoom(BaseModel):
 
     pin: str | None = Field(None, description="Pin of the room.")
     invite_token: str | None = Field(None, description="Invite token for the room.")
+
+
+class UpdateRoomAdmin(BaseModel):
+    """Request to grant or revoke room administration."""
+
+    is_admin: bool
 
 
 class BannedUserRead(BaseModel):

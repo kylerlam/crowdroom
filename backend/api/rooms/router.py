@@ -29,6 +29,7 @@ from backend.schemas.room import (
     JoinRoom,
     ReadRoom,
     UpdateRoom,
+    UpdateRoomAdmin,
 )
 from backend.schemas.user import UserRead
 from backend.services.room_membership_service import RoomMembershipService
@@ -146,6 +147,7 @@ async def create_room(
 async def update_room(
     room_id: UUID,
     room_data: UpdateRoom,
+    current_user: User = Depends(get_current_user),
     room_service: RoomService = Depends(get_room_service),
 ) -> ReadRoom:
     """Updates an existing room.
@@ -153,18 +155,21 @@ async def update_room(
     Args:
         room_id (UUID): The unique identifier of the room to update.
         room_data (UpdateRoom): The schema containing the fields to update.
+        current_user: The authenticated room owner.
         room_service (RoomService): The injected room service.
 
     Returns:
         ReadRoom: The updated room schema.
     """
-    return room_service.update_room(room_id, room_data)
+    room_service.assert_host(room_id, current_user.id)
+    return await room_service.update_room(room_id, room_data)
 
 
 @router.delete("/{room_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_room(
     room_id: UUID,
     request: Request,
+    current_user: User = Depends(get_current_user),
     room_service: RoomService = Depends(get_room_service),
 ) -> None:
     """Deletes a room from the system.
@@ -172,10 +177,30 @@ async def delete_room(
     Args:
         room_id (UUID): The unique identifier of the room to delete.
         request (Request): The incoming request (used to access app state).
+        current_user: The authenticated room owner.
         room_service (RoomService): The injected room service.
     """
+    room_service.assert_host(room_id, current_user.id)
     await request.app.state.playback_poller.stop_polling(room_id)
     room_service.delete_room(room_id)
+
+
+@router.patch(
+    "/{room_id}/admins/{user_id}",
+    response_model=ReadRoom,
+    status_code=status.HTTP_200_OK,
+)
+async def update_room_admin(
+    room_id: UUID,
+    user_id: UUID,
+    body: UpdateRoomAdmin,
+    current_user: User = Depends(get_current_user),
+    room_service: RoomService = Depends(get_room_service),
+) -> ReadRoom:
+    """Let the room owner grant or revoke administration for a member."""
+    return await room_service.set_admin(
+        room_id, current_user.id, user_id, body.is_admin
+    )
 
 
 @router.get(
@@ -277,12 +302,12 @@ async def kick_user(
     current_user: User = Depends(get_current_user),
     moderation_service: RoomModerationService = Depends(get_room_moderation_service),
 ) -> dict:
-    """Kick a member from a room. The host only; kicked users may rejoin.
+    """Let a room manager kick an eligible member, who may rejoin.
 
     Args:
         room_id: The room to kick from.
         user_id: The member being kicked.
-        current_user: The authenticated host.
+        current_user: The authenticated room manager.
         moderation_service: The injected moderation service.
 
     Returns:
@@ -299,12 +324,12 @@ async def ban_user(
     current_user: User = Depends(get_current_user),
     moderation_service: RoomModerationService = Depends(get_room_moderation_service),
 ) -> dict:
-    """Ban a user from a room. The host only; banned users cannot rejoin.
+    """Let a room manager ban an eligible user, preventing re-entry.
 
     Args:
         room_id: The room to ban from.
         user_id: The user being banned.
-        current_user: The authenticated host.
+        current_user: The authenticated room manager.
         moderation_service: The injected moderation service.
 
     Returns:
@@ -321,12 +346,12 @@ async def unban_user(
     current_user: User = Depends(get_current_user),
     moderation_service: RoomModerationService = Depends(get_room_moderation_service),
 ) -> None:
-    """Unban a user from a room. The host only.
+    """Let a room manager unban an eligible user.
 
     Args:
         room_id: The room to unban in.
         user_id: The user being unbanned.
-        current_user: The authenticated host.
+        current_user: The authenticated room manager.
         moderation_service: The injected moderation service.
     """
     moderation_service.unban_user(room_id, current_user.id, user_id)
@@ -342,11 +367,11 @@ async def list_bans(
     current_user: User = Depends(get_current_user),
     moderation_service: RoomModerationService = Depends(get_room_moderation_service),
 ) -> list[BannedUserRead]:
-    """List users banned from a room. The host only.
+    """List users banned from a room for a room manager.
 
     Args:
         room_id: The room whose bans to list.
-        current_user: The authenticated host.
+        current_user: The authenticated room manager.
         moderation_service: The injected moderation service.
 
     Returns:

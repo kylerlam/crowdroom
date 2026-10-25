@@ -64,7 +64,7 @@ class TestRoomModerationService:
                 return mock_manager
 
         manager = _run()
-        mock_room_service.assert_host.assert_called_once_with(room_id, host_id)
+        mock_room_service.assert_manager.assert_called_once_with(room_id, host_id)
         assert target.room_id is None
         mock_user_repo.save.assert_called_once_with(target)
         event = manager.broadcast.call_args[0][0]
@@ -84,7 +84,7 @@ class TestRoomModerationService:
     def test_kick_non_host_raises(
         self, service, mock_room_service, room_id, host_id, target
     ):
-        mock_room_service.assert_host.side_effect = ForbiddenException()
+        mock_room_service.assert_manager.side_effect = ForbiddenException()
 
         with pytest.raises(ForbiddenException):
             anyio.run(service.kick_user, room_id, host_id, target.id)
@@ -137,7 +137,7 @@ class TestRoomModerationService:
         self, service, mock_room_service, mock_ban_repo, room_id, host_id, target
     ):
         service.unban_user(room_id, host_id, target.id)
-        mock_room_service.assert_host.assert_called_once_with(room_id, host_id)
+        mock_room_service.assert_manager.assert_called_once_with(room_id, host_id)
         mock_ban_repo.remove.assert_called_once_with(room_id, target.id)
 
     def test_list_bans_resolves_usernames(

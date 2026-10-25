@@ -70,6 +70,44 @@ class RoomService:
             raise EntityNotFoundException("Room", room_id)
         return room
 
+    def assert_manager(self, room_id: UUID, user_id: UUID) -> Room:
+        """Require the room owner or a delegated administrator still in the room."""
+        room = self.get_room(room_id)
+        if room.host_user_id == user_id:
+            return room
+        if user_id in room.admin_user_ids and any(
+            user.id == user_id and user.room_id == room_id for user in room.users
+        ):
+            return room
+        raise ForbiddenException("Only the room host or an administrator can do this")
+
+    async def set_admin(
+        self, room_id: UUID, host_user_id: UUID, user_id: UUID, is_admin: bool
+    ) -> Room:
+        """Let only the owner grant or revoke a member's administrator role."""
+        room = self.assert_host(room_id, host_user_id)
+        if user_id == room.host_user_id:
+            raise ForbiddenException("The room host's role cannot be changed")
+        if is_admin and not any(
+            user.id == user_id and user.room_id == room_id for user in room.users
+        ):
+            raise EntityNotFoundException("Room membership", user_id)
+
+        admin_ids = list(room.admin_user_ids)
+        if is_admin and user_id not in admin_ids:
+            admin_ids.append(user_id)
+        elif not is_admin and user_id in admin_ids:
+            admin_ids.remove(user_id)
+        serialized_ids = [str(admin_id) for admin_id in admin_ids]
+        room = self._room_repo.update(
+            room_id, {"settings": {**room.settings, "admin_user_ids": serialized_ids}}
+        )
+        await manager.broadcast(
+            {"type": "admins_updated", "payload": {"admin_user_ids": serialized_ids}},
+            str(room_id),
+        )
+        return room
+
     def get_all_rooms(self) -> list[Room]:
         """Retrieve all publicly listable rooms.
 
@@ -183,6 +221,14 @@ class RoomService:
         """
         existing_room = self.get_room(room_id)
         data = room_data.model_dump(exclude_unset=True)
+
+        if (
+            isinstance(data.get("settings"), dict)
+            and "admin_user_ids" in existing_room.settings
+        ):
+            data["settings"]["admin_user_ids"] = existing_room.settings[
+                "admin_user_ids"
+            ]
 
         if "pin" in data:
             raw_pin = data.pop("pin")

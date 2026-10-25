@@ -1,4 +1,4 @@
-"""Service for host moderation actions: kicking and banning room members."""
+"""Service for room managers kicking and banning ordinary members."""
 
 from uuid import UUID
 
@@ -11,7 +11,7 @@ from backend.services.room_service import RoomService
 
 
 class RoomModerationService:
-    """Handles host-driven kick, ban, and unban operations for rooms."""
+    """Handles host and administrator moderation operations for rooms."""
 
     def __init__(
         self,
@@ -88,7 +88,7 @@ class RoomModerationService:
             EntityNotFoundException: If the room does not exist.
             ForbiddenException: If requester is not the host.
         """
-        self._room_service.assert_host(room_id, host_user_id)
+        self._prepare_target(room_id, host_user_id, target_user_id)
         self._ban_repo.remove(room_id, target_user_id)
 
     def list_bans(self, room_id: UUID, host_user_id: UUID) -> list[BannedUserRead]:
@@ -105,7 +105,7 @@ class RoomModerationService:
             EntityNotFoundException: If the room does not exist.
             ForbiddenException: If requester is not the host.
         """
-        self._room_service.assert_host(room_id, host_user_id)
+        self._room_service.assert_manager(room_id, host_user_id)
         bans = self._ban_repo.list_by_room(room_id)
         result: list[BannedUserRead] = []
         for ban in bans:
@@ -121,7 +121,7 @@ class RoomModerationService:
         return result
 
     def _prepare_target(self, room_id: UUID, host_user_id: UUID, target_user_id: UUID):
-        """Assert host, reject self-targeting, and load the target user.
+        """Authorize a manager, protect room roles, and load the target user.
 
         Args:
             room_id: The room the action applies to.
@@ -135,9 +135,15 @@ class RoomModerationService:
             EntityNotFoundException: If room or target user does not exist.
             ForbiddenException: If requester is not the host, or targets self.
         """
-        self._room_service.assert_host(room_id, host_user_id)
+        room = self._room_service.assert_manager(room_id, host_user_id)
         if target_user_id == host_user_id:
-            raise ForbiddenException("The host cannot kick or ban themselves")
+            raise ForbiddenException("Room managers cannot kick or ban themselves")
+        if target_user_id == room.host_user_id:
+            raise ForbiddenException("The room host cannot be kicked or banned")
+        if host_user_id != room.host_user_id and target_user_id in room.admin_user_ids:
+            raise ForbiddenException(
+                "Administrators cannot manage other administrators"
+            )
         target = self._user_repo.get_by_id(target_user_id)
         if target is None:
             raise EntityNotFoundException("User", target_user_id)
@@ -151,6 +157,11 @@ class RoomModerationService:
             target: The User being evicted.
             event_type: The broadcast event ('member_kicked' or 'member_banned').
         """
+        room = self._room_service.get_room(room_id)
+        if target.id in room.admin_user_ids:
+            await self._room_service.set_admin(
+                room_id, room.host_user_id, target.id, False
+            )
         target.room_id = None
         self._user_repo.save(target)
         await manager.broadcast(

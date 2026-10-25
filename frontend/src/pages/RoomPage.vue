@@ -55,7 +55,7 @@
               <span class="skip-vote-badge">{{ currentSong.votes_skip || 0 }}</span>
             </button>
           </div>
-          <div v-if="isHost" class="playback-controls">
+          <div v-if="isManager" class="playback-controls">
             <button class="btn btn-icon" title="Play/Pause" @click="togglePlayPause">
               <i :class="isPlaying ? 'ph ph-pause' : 'ph ph-play'"></i>
             </button>
@@ -156,10 +156,22 @@
                 (member.username || '?')[0].toUpperCase()
               }}</span>
               <span>{{ member.username || 'Unknown' }}</span>
+              <span v-if="member.id === hostUserId" class="member-role">Host</span>
+              <span v-else-if="adminUserIds.includes(member.id)" class="member-role">Admin</span>
               <span
-                v-if="isHost && member.id !== userId"
+                v-if="canManageMember(member)"
                 class="member-actions"
               >
+                <button
+                  v-if="isHost"
+                  type="button"
+                  class="member-action-btn"
+                  :aria-label="`${adminUserIds.includes(member.id) ? 'Revoke admin from' : 'Make admin:'} ${member.username || 'user'}`"
+                  :title="adminUserIds.includes(member.id) ? 'Revoke admin' : 'Make admin'"
+                  @click="toggleAdmin(member)"
+                >
+                  <i :class="adminUserIds.includes(member.id) ? 'ph ph-shield-slash' : 'ph ph-shield-check'"></i>
+                </button>
                 <button
                   type="button"
                   class="member-action-btn"
@@ -184,8 +196,8 @@
         </details>
       </aside>
 
-      <!-- Banned users (host only) -->
-      <aside v-if="isHost" class="panel members-panel">
+      <!-- Banned users -->
+      <aside v-if="isManager" class="panel members-panel">
         <details @toggle="onBansToggle">
           <summary>
             <h3>
@@ -363,7 +375,7 @@
 import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
 import { useRouter, onBeforeRouteLeave } from 'vue-router';
 import QRCode from 'qrcode';
-import { apiGet, apiPost, apiDelete } from '../composables/useApi.js';
+import { apiGet, apiPost, apiPatch, apiDelete } from '../composables/useApi.js';
 import { useAuth } from '../composables/useAuth.js';
 import { useWebSocket } from '../composables/useWebSocket.js';
 import { useToast } from '../composables/useToast.js';
@@ -384,6 +396,9 @@ const roomId = ref(props.id);
 const roomName = ref('Loading...');
 const roomCode = ref('');
 const isHost = ref(false);
+const hostUserId = ref(null);
+const adminUserIds = ref([]);
+const isManager = computed(() => isHost.value || adminUserIds.value.includes(userId.value));
 const sessionId = ref(null);
 
 const currentSong = ref(null);
@@ -560,6 +575,8 @@ async function loadRoom() {
   roomName.value = room.room_name;
   roomCode.value = room.room_code;
   isHost.value = room.host_user_id === userId.value;
+  hostUserId.value = room.host_user_id;
+  adminUserIds.value = room.admin_user_ids || [];
   if (isHost.value) await checkSpotifyConnection();
 }
 
@@ -608,7 +625,7 @@ async function loadMembers() {
 }
 
 async function loadBans() {
-  if (!isHost.value) return;
+  if (!isManager.value) return;
   try {
     bannedUsers.value = await apiGet(`/rooms/${roomId.value}/bans`);
   } catch (err) {
@@ -618,6 +635,22 @@ async function loadBans() {
 
 function onBansToggle(event) {
   if (event.target.open) loadBans();
+}
+
+function canManageMember(member) {
+  if (member.id === hostUserId.value) return false;
+  return isHost.value || (isManager.value && !adminUserIds.value.includes(member.id));
+}
+
+async function toggleAdmin(member) {
+  try {
+    const room = await apiPatch(`/rooms/${roomId.value}/admins/${member.id}`, {
+      is_admin: !adminUserIds.value.includes(member.id),
+    });
+    adminUserIds.value = room.admin_user_ids || [];
+  } catch (err) {
+    showToast(err.detail || 'Could not update administrator');
+  }
 }
 
 async function kickMember(member) {
@@ -953,6 +986,9 @@ function setupWebSocket() {
   };
   register('member_joined', refreshMembers);
   register('member_left', refreshMembers);
+  register('admins_updated', (msg) => {
+    adminUserIds.value = msg.payload?.admin_user_ids || [];
+  });
 
   const handleRemoval = (label) => (msg) => {
     if (msg.payload?.user_id !== userId.value) {

@@ -199,6 +199,11 @@
   gap: var(--space-1);
 }
 
+.member-role {
+  color: var(--accent);
+  font-size: var(--font-size-xs);
+}
+
 .member-action-btn {
   display: flex;
   align-items: center;
