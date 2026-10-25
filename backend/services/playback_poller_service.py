@@ -664,10 +664,22 @@ class PlaybackPollerService:
                         queue_owns_current = self._queue_owns_current_track(
                             session, current_item
                         )
+                        current_duration = (
+                            current_item.song.duration if queue_owns_current else None
+                        )
+                        queue_track_ended = (
+                            isinstance(current_duration, (int, float))
+                            and current_duration > 0
+                            and self._estimated_position_ms(session)
+                            >= current_duration * 1000 - 5000
+                        )
 
                         should_advance_with_next = (
                             state.track_id == next_external_id
-                            or (queue_owns_current and next_item is not None)
+                            or (
+                                queue_owns_current
+                                and (next_item is not None or queue_track_ended)
+                            )
                         )
                         should_take_over_with_current = (
                             current_item is not None and not queue_owns_current

@@ -5,12 +5,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import anyio
+import httpx
 import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session as DBSession
 from sqlmodel import SQLModel, create_engine
 
-from backend.adapters.spotify_playback_adapter import SpotifyPlaybackState
+from backend.adapters.spotify_playback_adapter import (
+    SpotifyPlaybackAdapter,
+    SpotifyPlaybackState,
+)
 from backend.core.exceptions import (
     SpotifyConnectionRequiredException,
     SpotifyUpstreamException,
@@ -32,7 +36,9 @@ from backend.services.room_service import RoomService
 @pytest.fixture
 def recovery_stack():
     """Wire real queue/session persistence with a mocked Spotify boundary."""
-    engine = create_engine("sqlite://", poolclass=StaticPool)
+    engine = create_engine(
+        "sqlite://", poolclass=StaticPool, connect_args={"check_same_thread": False}
+    )
     SQLModel.metadata.create_all(engine)
     with DBSession(engine) as db:
         owner = User(username="owner")
@@ -315,6 +321,101 @@ def test_lost_phone_context_restores_elapsed_position_and_holds_after_failure(
     assert session.playback_status == ItemStatus.PAUSED
     assert session.playback_position_ms == 120000
     assert session.playback_started_at is None
+
+
+def test_missing_phone_album_context_preserves_the_real_pending_queue(recovery_stack):
+    """A mobile metadata failure does not mark a queued song as played or remove it."""
+    session, first, _, repo, queue, _, control, _ = recovery_stack
+    item = repo.create(
+        QueueItem(session_id=session.id, song_id=first.id, group="manual")
+    )
+    control._session_repo.update(session.id, {"current_device_id": "iphone"})
+    client_type = httpx.AsyncClient
+
+    def handle(request):
+        if request.url.path.endswith("/devices"):
+            return httpx.Response(
+                200,
+                json={
+                    "devices": [
+                        {
+                            "id": "iphone",
+                            "type": "Smartphone",
+                            "name": "iPhone",
+                            "is_active": True,
+                            "is_restricted": False,
+                        }
+                    ]
+                },
+            )
+        if request.url.path.startswith("/v1/tracks/"):
+            return httpx.Response(200, json={"album": None})
+        raise AssertionError("No Play should be sent without a mobile album context")
+
+    async def run():
+        with (
+            patch.object(
+                control,
+                "_get_adapter",
+                new=AsyncMock(return_value=SpotifyPlaybackAdapter("token")),
+            ),
+            patch(
+                "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
+                side_effect=lambda: client_type(transport=httpx.MockTransport(handle)),
+            ),
+        ):
+            with pytest.raises(
+                SpotifyUpstreamException, match="album playback context"
+            ):
+                await control.play(session.room_id, uuid4(), first.id)
+
+    anyio.run(run)
+    assert [queued.id for queued in queue.get_queue(session.id)] == [item.id]
+    assert session.current_song_id is None
+    assert session.playback_status == ItemStatus.PAUSED
+
+
+def test_finishing_last_queued_track_pauses_album_context_and_clears_session(
+    recovery_stack,
+):
+    """The album's follow-up track cannot keep playing after the room queue drains."""
+    session, first, _, repo, queue, playback, control, adapter = recovery_stack
+    repo.create(QueueItem(session_id=session.id, song_id=first.id, group="manual"))
+    control._session_repo.update(
+        session.id,
+        {
+            "current_song_id": first.external_id,
+            "current_device_id": "iphone",
+            "playback_status": ItemStatus.PLAYING,
+        },
+    )
+    poller = PlaybackPollerService()
+
+    async def run():
+        with (
+            patch(
+                "backend.services.playback_poller_service.engine",
+                control._session_repo._session.get_bind(),
+            ),
+            patch.object(
+                poller,
+                "_build_playback_service_with_queue",
+                return_value=(playback, queue),
+            ),
+            patch.object(poller, "_broadcast_state_changed", new=AsyncMock()),
+        ):
+            await poller._advance_queue_locked(
+                session, session.room_id, uuid4(), adapter
+            )
+
+    anyio.run(run)
+    adapter.pause.assert_awaited_once_with("iphone")
+    adapter.play.assert_not_awaited()
+    saved = control._session_repo.get_by_id(session.id, fresh=True)
+    assert queue.get_queue_count(session.id) == 0
+    assert saved.current_song_id is None
+    assert saved.playback_status == ItemStatus.STOPPED
+    assert saved.playback_position_ms == 0
 
 
 @pytest.mark.parametrize("status", [ItemStatus.PAUSED, ItemStatus.STOPPED])

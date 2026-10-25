@@ -12,12 +12,12 @@ from backend.adapters.spotify_playback_adapter import SpotifyPlaybackAdapter
 from backend.core.exceptions import SpotifyUpstreamException
 
 
-def phone(*, active=True, device_id="iphone"):
+def phone(*, active=True, device_id="iphone", device_type="smartphone"):
     """Return a Spotify Connect phone fixture."""
     return {
         "id": device_id,
         "name": "iPhone",
-        "type": "smartphone",
+        "type": device_type,
         "is_active": active,
         "is_restricted": False,
     }
@@ -34,10 +34,26 @@ def playback(*, track="queued-track", device_id="iphone", playing=True):
 
 
 @contextmanager
-def spotify_http(handler):
+def spotify_http(handler, *, track_status=200, track_data=None):
     """Keep actual request construction while replacing Spotify with MockTransport."""
     client_type = httpx.AsyncClient
-    transport = httpx.MockTransport(handler)
+    requests = []
+
+    def dispatch(request):
+        requests.append(request)
+        if request.method == "GET" and request.url.path.startswith("/v1/tracks/"):
+            data = (
+                track_data
+                if track_data is not None
+                else {
+                    "uri": "spotify:track:" + request.url.path.rsplit("/", 1)[-1],
+                    "album": {"uri": "spotify:album:album-id"},
+                }
+            )
+            return httpx.Response(track_status, json=data)
+        return handler(request)
+
+    transport = httpx.MockTransport(dispatch)
     with (
         patch(
             "backend.adapters.spotify_playback_adapter.httpx.AsyncClient",
@@ -47,11 +63,11 @@ def spotify_http(handler):
             "backend.adapters.spotify_playback_adapter.asyncio.sleep", new=AsyncMock()
         ),
     ):
-        yield
+        yield requests
 
 
-def test_inactive_phone_receives_uri_without_a_racing_transfer():
-    """Initial URI Play targets an available inactive phone without another transfer."""
+def test_inactive_phone_receives_album_context_without_a_racing_transfer():
+    """Phone playback uses its album offset directly, without trying a URI list."""
     requests = []
     counts = {"devices": 0, "state": 0}
 
@@ -84,7 +100,8 @@ def test_inactive_phone_receives_uri_without_a_racing_transfer():
     assert len(commands) == 1
     assert commands[0].url.params["device_id"] == "iphone"
     assert json.loads(commands[0].content) == {
-        "uris": ["spotify:track:queued-track"],
+        "context_uri": "spotify:album:album-id",
+        "offset": {"uri": "spotify:track:queued-track"},
         "position_ms": 45000,
     }
     assert counts["state"] == 3
@@ -197,6 +214,124 @@ def test_explicit_selection_still_requests_transfer_without_claiming_playback():
     assert json.loads(writes[0].content) == {"device_ids": ["iphone"], "play": False}
 
 
+@pytest.mark.parametrize("device_type", ["Smartphone", "Tablet"])
+@pytest.mark.parametrize("position_ms", [None, 57000])
+def test_mobile_play_uses_album_context_and_preserves_the_requested_offset(
+    device_type, position_ms
+):
+    """Mobile targets receive context directly, never a first failing URI-list Play."""
+
+    def handle(request):
+        if request.method == "GET" and request.url.path.endswith("/devices"):
+            return httpx.Response(
+                200, json={"devices": [phone(device_type=device_type)]}
+            )
+        if request.method == "GET":
+            return httpx.Response(200, json=playback())
+        return httpx.Response(204)
+
+    async def run():
+        with spotify_http(handle) as requests:
+            await SpotifyPlaybackAdapter("token").play(
+                "spotify:track:queued-track", "iphone", position_ms=position_ms
+            )
+            return requests
+
+    requests = anyio.run(run)
+    metadata = [
+        request for request in requests if request.url.path.startswith("/v1/tracks/")
+    ]
+    commands = [request for request in requests if request.method == "PUT"]
+    assert len(metadata) == len(commands) == 1
+    assert metadata[0].url.path == "/v1/tracks/queued-track"
+    assert json.loads(commands[0].content) == {
+        "context_uri": "spotify:album:album-id",
+        "offset": {"uri": "spotify:track:queued-track"},
+        "position_ms": position_ms or 0,
+    }
+    assert commands[0].url.params["device_id"] == "iphone"
+
+
+def test_desktop_keeps_uri_list_playback_without_loading_track_metadata():
+    """The mobile context workaround does not add metadata calls on computers."""
+
+    def handle(request):
+        if request.method == "GET" and request.url.path.endswith("/devices"):
+            return httpx.Response(
+                200,
+                json={"devices": [phone(device_id="desktop", device_type="Computer")]},
+            )
+        if request.method == "GET":
+            return httpx.Response(200, json=playback(device_id="desktop"))
+        return httpx.Response(204)
+
+    async def run():
+        with spotify_http(handle) as requests:
+            await SpotifyPlaybackAdapter("token").play(
+                "spotify:track:queued-track", "desktop"
+            )
+            return requests
+
+    requests = anyio.run(run)
+    assert not any(request.url.path.startswith("/v1/tracks/") for request in requests)
+    commands = [request for request in requests if request.method == "PUT"]
+    assert len(commands) == 1
+    assert json.loads(commands[0].content) == {"uris": ["spotify:track:queued-track"]}
+
+
+@pytest.mark.parametrize(
+    "track_status,track_data",
+    [
+        (200, {}),
+        (200, {"album": None}),
+        (404, {}),
+    ],
+)
+def test_missing_mobile_album_context_fails_clearly_before_any_play(
+    track_status, track_data
+):
+    """An unavailable album is an actionable error, not a silent URI-list fallback."""
+    writes = []
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"devices": [phone()]})
+        writes.append(request)
+        return httpx.Response(204)
+
+    async def run():
+        with spotify_http(handle, track_status=track_status, track_data=track_data):
+            await SpotifyPlaybackAdapter("token").play(
+                "spotify:track:queued-track", "iphone"
+            )
+
+    with pytest.raises(SpotifyUpstreamException, match="album playback context"):
+        anyio.run(run)
+    assert writes == []
+
+
+def test_mobile_metadata_401_is_available_to_the_existing_token_refresh_path():
+    """Token renewal can retry metadata before a Play command has been sent."""
+    writes = []
+
+    def handle(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"devices": [phone()]})
+        writes.append(request)
+        return httpx.Response(204)
+
+    async def run():
+        with spotify_http(handle, track_status=401):
+            await SpotifyPlaybackAdapter("token").play(
+                "spotify:track:queued-track", "iphone"
+            )
+
+    with pytest.raises(httpx.HTTPStatusError) as error:
+        anyio.run(run)
+    assert error.value.response.status_code == 401
+    assert writes == []
+
+
 def test_only_explicit_404_recovery_transfers_before_one_retry():
     """A rejected Play may re-activate its exact target once without losing position."""
     writes = []
@@ -229,7 +364,8 @@ def test_only_explicit_404_recovery_transfers_before_one_retry():
     for command in (writes[0], writes[2]):
         assert command.url.params["device_id"] == "iphone"
         assert json.loads(command.content) == {
-            "uris": ["spotify:track:queued-track"],
+            "context_uri": "spotify:album:album-id",
+            "offset": {"uri": "spotify:track:queued-track"},
             "position_ms": 45000,
         }
 

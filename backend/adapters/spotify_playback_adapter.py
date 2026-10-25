@@ -90,23 +90,8 @@ class SpotifyPlaybackAdapter:
             )
             response.raise_for_status()
 
-    async def prepare_device(
-        self,
-        device_id: str | None = None,
-        *,
-        force_transfer: bool = False,
-        transfer_if_inactive: bool = True,
-    ) -> str:
-        """Select an available device before sending an explicit playback command.
-
-        Args:
-            device_id: Selected target. Never silently substitutes another device.
-            force_transfer: Re-activate once after an explicit missing-device error.
-            transfer_if_inactive: Transfer during explicit selection, not initial Play.
-
-        Returns:
-            The available device ID. Actual playback is confirmed after Play.
-        """
+    async def _resolve_device(self, device_id: str | None = None) -> dict:
+        """Resolve an available target without changing Spotify's playback state."""
         devices = [
             device
             for device in await self.get_devices()
@@ -123,8 +108,23 @@ class SpotifyPlaybackAdapter:
                 detail="The selected Spotify device is unavailable. "
                 "Open Spotify on that device and refresh the device list.",
             )
+        return device
+
+    async def prepare_device(
+        self, device_id: str | None = None, *, force_transfer: bool = False
+    ) -> str:
+        """Select an available device without claiming playback has started.
+
+        Args:
+            device_id: Selected target. Never silently substitutes another device.
+            force_transfer: Re-activate once after an explicit missing-device error.
+
+        Returns:
+            The available device ID. Actual playback is confirmed after Play.
+        """
+        device = await self._resolve_device(device_id)
         device_id = device["id"]
-        if not force_transfer and (device["is_active"] or not transfer_if_inactive):
+        if device["is_active"] and not force_transfer:
             return device_id
         await self.transfer(device_id)
         # With no playback context, transfer(play=False) may leave an available
@@ -169,12 +169,46 @@ class SpotifyPlaybackAdapter:
         position_ms: int | None = None,
     ) -> str | None:
         """Prepare the target, issue Play once, and verify the real track and device."""
-        device_id = await self.prepare_device(device_id, transfer_if_inactive=False)
+        device = await self._resolve_device(device_id)
+        device_id = device["id"]
         async with httpx.AsyncClient() as client:
+            body = {"uris": [track_uri]} if track_uri else {}
+            if track_uri and device["type"].casefold() in {"smartphone", "tablet"}:
+                # Some mobile Connect players accept a URI list without starting it.
+                # An album context plus the track offset starts the same song there.
+                track_id = track_uri.rsplit(":", 1)[-1]
+                track = await client.get(
+                    url="https://api.spotify.com/v1/tracks/" + track_id,
+                    headers=self._headers(),
+                )
+                if track.status_code == 401:
+                    track.raise_for_status()
+                if track.is_error:
+                    raise SpotifyUpstreamException(
+                        status_code=track.status_code,
+                        detail="Spotify could not load the album playback context "
+                        "for this song on the selected phone. "
+                        "Try another song or playback device.",
+                    )
+                album = track.json().get("album") or {}
+                album_uri = album.get("uri")
+                if not isinstance(album_uri, str) or not album_uri.startswith(
+                    "spotify:album:"
+                ):
+                    raise SpotifyUpstreamException(
+                        status_code=502,
+                        detail="Spotify did not provide an album playback context "
+                        "for this song on the selected phone. "
+                        "Choose another song or playback device.",
+                    )
+                body = {
+                    "context_uri": album_uri,
+                    "offset": {"uri": track_uri},
+                    "position_ms": max(0, position_ms or 0),
+                }
+            elif position_ms is not None:
+                body["position_ms"] = max(0, position_ms)
             for attempt in range(2):
-                body = {"uris": [track_uri]} if track_uri else {}
-                if position_ms is not None:
-                    body["position_ms"] = max(0, position_ms)
                 kwargs = {"json": body} if body else {}
                 response = await client.put(
                     url=self.BASE_URL + "/play",

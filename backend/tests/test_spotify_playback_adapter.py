@@ -16,7 +16,9 @@ class TestSpotifyPlaybackAdapterPlay:
     @pytest.fixture
     def adapter(self):
         adapter = SpotifyPlaybackAdapter("test_token")
-        adapter.prepare_device = AsyncMock(side_effect=lambda device_id: device_id)
+        adapter._resolve_device = AsyncMock(
+            side_effect=lambda device_id: {"id": device_id, "type": "computer"}
+        )
         adapter._confirm_playback = AsyncMock()
         return adapter
 

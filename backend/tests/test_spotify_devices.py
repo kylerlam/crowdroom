@@ -57,6 +57,9 @@ def test_missing_device_rediscovery_preserves_command_and_retries_once(
 ):
     """A 404 re-activates the same chosen device and preserves the command."""
     adapter = SpotifyPlaybackAdapter("token")
+    adapter._resolve_device = AsyncMock(
+        return_value={"id": expected, "type": "computer"}
+    )
     adapter.prepare_device = AsyncMock(return_value=expected)
     adapter._confirm_playback = AsyncMock()
     client = AsyncMock()
@@ -75,7 +78,7 @@ def test_missing_device_rediscovery_preserves_command_and_retries_once(
             )
 
     assert anyio.run(run) == expected
-    assert adapter.prepare_device.await_count == 2
+    assert adapter.prepare_device.await_count == 1
     assert adapter.prepare_device.await_args.kwargs == {"force_transfer": True}
     assert client.put.await_count == 2
     retried = client.put.await_args_list[1].kwargs
@@ -86,8 +89,8 @@ def test_missing_device_rediscovery_preserves_command_and_retries_once(
         assert retried["json"] == {"uris": ["spotify:track:first"]}
 
 
-def test_inactive_available_device_is_activated_before_playback():
-    """An online browser need not already be Spotify's active player."""
+def test_inactive_available_device_can_receive_play_without_an_extra_transfer():
+    """An explicit URI can activate an available player without racing a transfer."""
     adapter = SpotifyPlaybackAdapter("token")
     adapter.get_devices = AsyncMock(
         side_effect=[[device("browser")], [device("browser", active=True)]]
@@ -106,7 +109,7 @@ def test_inactive_available_device_is_activated_before_playback():
             return await adapter.play("spotify:track:first")
 
     assert anyio.run(run) == "browser"
-    adapter.transfer.assert_awaited_once_with("browser")
+    adapter.transfer.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -158,6 +161,9 @@ def test_transfer_preserves_playing_or_paused_state():
 def test_device_404_retry_is_bounded_even_if_transfer_succeeds():
     """An unavailable web player cannot cause an unbounded retry loop."""
     adapter = SpotifyPlaybackAdapter("token")
+    adapter._resolve_device = AsyncMock(
+        return_value={"id": "browser", "type": "computer"}
+    )
     adapter.prepare_device = AsyncMock(return_value="browser")
     client = AsyncMock()
     client.__aenter__.return_value = client
@@ -173,7 +179,7 @@ def test_device_404_retry_is_bounded_even_if_transfer_succeeds():
     with pytest.raises(httpx.HTTPStatusError):
         anyio.run(run)
     assert client.put.await_count == 2
-    assert adapter.prepare_device.await_count == 2
+    assert adapter.prepare_device.await_count == 1
 
 
 @pytest.fixture
