@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   userId: { value: 'owner' },
   apiGet: vi.fn(),
   apiPost: vi.fn(),
+  apiPut: vi.fn(),
   apiPatch: vi.fn(),
   apiDelete: vi.fn(),
   handlers: new Map(),
@@ -21,6 +22,7 @@ vi.mock('../composables/useAuth.js', () => ({ useAuth: () => ({ userId: mocks.us
 vi.mock('../composables/useApi.js', () => ({
   apiGet: mocks.apiGet,
   apiPost: mocks.apiPost,
+  apiPut: mocks.apiPut,
   apiPatch: mocks.apiPatch,
   apiDelete: mocks.apiDelete,
 }));
@@ -39,7 +41,9 @@ vi.mock('../composables/useWebSocket.js', () => ({
 let wrapper;
 let room;
 let pending;
-let connections;
+let authorized;
+let devices;
+let selectedDeviceId;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -47,9 +51,12 @@ beforeEach(() => {
   mocks.userId.value = 'owner';
   room = { host_user_id: 'owner', admin_user_ids: ['admin'], room_name: 'Music room', room_code: 'ABC' };
   pending = [];
-  connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: '2099-01-01T00:00:00' }];
+  authorized = true;
+  devices = [{ id: 'desktop', name: 'Desktop', type: 'computer', is_active: true, is_restricted: false }];
+  selectedDeviceId = 'desktop';
   mocks.apiGet.mockImplementation(async (path) => {
-    if (path === '/platform-connections/') return connections;
+    if (path === '/playback/spotify/status') return { authorized };
+    if (path === '/playback/devices') return { devices, selected_device_id: selectedDeviceId };
     if (path === '/platform-connections/spotify/has-app-credentials') return { has_credentials: true };
     if (path === '/rooms/room') return room;
     if (path === '/session/by-room/room') return { id: 'session' };
@@ -105,37 +112,61 @@ describe('room administrator controls', () => {
 });
 
 describe('idle playback recovery', () => {
-  it('requires account authorization for playback while keeping app-credential search available', async () => {
-    connections = [{ platform: 'spotify', connection_type: 'client_credentials', token_expires_at: null }];
+  it('shows account authorization in the header while keeping app-credential search available', async () => {
+    authorized = false;
     await renderRoom();
-    expect(wrapper.text()).toContain('Connect your Spotify account to enable playback.');
-    expect(wrapper.get('a[href="/profile"]').attributes('target')).toBe('_blank');
-    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
+    const status = wrapper.get('[aria-label="Spotify disconnected"]');
+    expect(status.attributes('data-tooltip')).toBe('Disconnected');
+    expect(status.attributes('href')).toBe('/profile');
+    expect(status.attributes('target')).toBe('_blank');
+    expect(wrapper.find('#spotify-authorization-required').exists()).toBe(false);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
     expect(wrapper.get('input[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
   });
 
   it('refreshes authorization when returning from the profile tab', async () => {
-    connections = [];
+    authorized = false;
     await renderRoom();
-    connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: '2020-01-01T00:00:00' }];
+    authorized = true;
     window.dispatchEvent(new Event('focus'));
     await flushPromises();
-    expect(wrapper.find('#spotify-authorization-required').exists()).toBe(false);
-    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeUndefined();
+    expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(true);
   });
 
-  it('shows authorization recovery when Spotify OAuth becomes unavailable', async () => {
+  it('updates the header when Spotify OAuth becomes unavailable', async () => {
     await renderRoom();
     mocks.handlers.get('oauth_required')({});
     await flushPromises();
-    expect(wrapper.find('#spotify-authorization-required').exists()).toBe(true);
-    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.find('[aria-label="Spotify disconnected"]').exists()).toBe(true);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
   });
-  it('shows the exact empty queue prompt without calling play', async () => {
+
+  it('shows the empty queue prompt on two lines only after Resume is clicked, without calling play', async () => {
+    authorized = false;
     await renderRoom();
-    expect(wrapper.text()).toContain('Add a song first ლ(´•д• ̀ლ');
+    expect(wrapper.find('.empty-queue-prompt').exists()).toBe(false);
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    const lines = wrapper.findAll('.empty-queue-prompt span');
+    expect(lines.map((line) => line.text())).toEqual(['Add a song first', 'ლ(´•д• ̀ლ']);
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+
+  it('clears the empty queue prompt when a song is added', async () => {
+    await renderRoom();
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    mocks.handlers.get('queue_updated')({ queue: [{ id: 'item', song: { title: 'New song' } }] });
+    await flushPromises();
+    expect(wrapper.find('.empty-queue-prompt').exists()).toBe(false);
+  });
+
+  it('requires authorization before resuming a nonempty queue', async () => {
+    authorized = false;
+    pending = [{ id: 'item', song: { title: 'Next song' } }];
+    await renderRoom();
     await wrapper.get('[title="Resume playback"]').trigger('click');
     expect(mocks.apiPost).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith('Connect Spotify from the link icon above.');
   });
 
   it('lets an administrator resume a queued song', async () => {
@@ -188,6 +219,25 @@ describe('queue priority controls', () => {
     expect(wrapper.findAll('.queue-panel .track-item-title').map((item) => item.text())).toEqual(['Third', 'First', 'Second']);
   });
 
+  it('uses matching icons and tooltips for queue actions', async () => {
+    await renderRoom();
+    expect(wrapper.get('[aria-label="Jump Second"] .ph-arrow-up').exists()).toBe(true);
+    expect(wrapper.get('[aria-label="Jump Second"]').attributes('data-tooltip')).toBe('Jump');
+    expect(wrapper.get('[aria-label="Pin Second"] .ph-push-pin').exists()).toBe(true);
+    expect(wrapper.get('[aria-label="Dequeue Second"] .ph-x').exists()).toBe(true);
+    expect(wrapper.get('[aria-label="Dequeue First"]').attributes('data-tooltip')).toBe('Dequeue');
+  });
+
+  it('lets an administrator dequeue a song and reloads the queue', async () => {
+    mocks.userId.value = 'admin';
+    await renderRoom();
+    mocks.apiDelete.mockImplementation(async () => { pending = pending.filter((item) => item.id !== 'item-1'); });
+    await wrapper.get('[aria-label="Dequeue Second"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiDelete).toHaveBeenCalledWith('/queue/item-1');
+    expect(wrapper.findAll('.queue-panel .track-item-title').map((item) => item.text())).toEqual(['First', 'Third']);
+  });
+
   it('lets administrators toggle Pin and displays the returned pinned priority', async () => {
     mocks.userId.value = 'admin';
     await renderRoom();
@@ -219,5 +269,66 @@ describe('queue priority controls', () => {
     expect(wrapper.find('.queue-pinned').exists()).toBe(true);
     expect(wrapper.find('.queue-pin').exists()).toBe(false);
     expect(wrapper.find('.queue-jump').exists()).toBe(false);
+    expect(wrapper.find('.queue-dequeue').exists()).toBe(false);
+  });
+});
+
+
+describe('Spotify manager status and devices', () => {
+  it('shows the room host authorization status to administrators', async () => {
+    mocks.userId.value = 'admin';
+    await renderRoom();
+    expect(mocks.apiGet).toHaveBeenCalledWith('/playback/spotify/status');
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/platform-connections/');
+    expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
+    expect(wrapper.get('a[href="/profile"]').text()).toBe('Profile');
+  });
+
+  it('does not request or reveal Spotify status and devices to ordinary members', async () => {
+    mocks.userId.value = 'guest';
+    await renderRoom();
+    window.dispatchEvent(new Event('focus'));
+    mocks.handlers.get('oauth_required')({});
+    await flushPromises();
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/spotify/status');
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/devices');
+    expect(wrapper.find('.spotify-status').exists()).toBe(false);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
+  });
+
+  it('hides Spotify status and devices immediately after administrator access is revoked', async () => {
+    mocks.userId.value = 'admin';
+    await renderRoom();
+    mocks.handlers.get('admins_updated')({ payload: { admin_user_ids: [] } });
+    await flushPromises();
+    expect(wrapper.find('.spotify-status').exists()).toBe(false);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
+  });
+
+  it('lets managers select an available playback device without requesting play', async () => {
+    devices.push({ id: 'speaker', name: 'Speaker', type: 'speaker', is_active: false, is_restricted: false });
+    devices.push({ id: 'restricted', name: 'Restricted', type: 'speaker', is_active: false, is_restricted: true });
+    await renderRoom();
+    expect(wrapper.findAll('#spotify-device option').map((option) => option.text())).toEqual(['Select a device', 'Desktop (active)', 'Speaker']);
+    mocks.apiPut.mockImplementation(async (_path, body) => { selectedDeviceId = body.device_id; });
+    await wrapper.get('#spotify-device').setValue('speaker');
+    await flushPromises();
+    expect(mocks.apiPut).toHaveBeenCalledWith('/playback/device', { device_id: 'speaker' });
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+    expect(wrapper.get('#spotify-device').element.value).toBe('speaker');
+  });
+
+  it('distinguishes an offline device from missing account authorization and supports refreshing devices', async () => {
+    devices = [];
+    selectedDeviceId = null;
+    await renderRoom();
+    expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain('No Spotify devices are available. Keep Spotify open, then refresh devices.');
+    expect(wrapper.get('a[href="https://open.spotify.com/"]').attributes('target')).toBe('_blank');
+    devices = [{ id: 'desktop', name: 'Desktop', is_active: true }];
+    await wrapper.get('.spotify-device-controls button').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('#spotify-device').element.value).toBe('desktop');
+    expect(wrapper.find('.spotify-device-help').exists()).toBe(false);
   });
 });

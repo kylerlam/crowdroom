@@ -129,12 +129,88 @@
   gap: var(--space-4);
 }
 
-.spotify-playback-notice {
+.empty-queue-prompt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.empty-queue-face {
+  font-size: var(--font-size-xl);
+}
+
+.spotify-status.connected {
+  color: var(--accent);
+}
+
+.spotify-device-panel {
+  margin-top: var(--space-4);
+}
+
+.spotify-device-panel summary {
+  color: var(--text-secondary);
+  font-size: var(--font-size-sm);
+}
+
+.spotify-device-controls {
   display: grid;
-  justify-items: center;
-  gap: var(--space-3);
-  padding: var(--space-4);
-  text-align: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+.spotify-device-controls label,
+.spotify-device-help,
+.spotify-device-link {
+  font-size: var(--font-size-sm);
+}
+
+.spotify-device-help,
+.spotify-device-link {
+  margin-top: var(--space-3);
+}
+
+.spotify-device-link {
+  display: inline-block;
+}
+
+.icon-tooltip {
+  position: relative;
+}
+
+.icon-tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  bottom: calc(100% + var(--space-2));
+  left: 50%;
+  transform: translateX(-50%);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-regular);
+  line-height: 1.5;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 60;
+}
+
+.icon-tooltip:hover::after,
+.icon-tooltip:focus-visible::after {
+  opacity: 1;
+}
+
+.queue-dequeue::after {
+  left: auto;
+  right: 0;
+  transform: none;
+}
+
+.room-header .icon-tooltip::after {
+  bottom: auto;
+  top: calc(100% + var(--space-2));
 }
 
 .playback-controls .btn-icon {
@@ -195,14 +271,47 @@
   }
 }
 
+.queue-panel .track-list {
+  padding-top: var(--space-6);
+}
+
 .queue-panel .track-item-actions {
-  flex-wrap: wrap;
-  justify-content: flex-end;
+  gap: var(--space-1);
 }
 
 .queue-panel .track-item-actions .btn {
-  padding: var(--space-1) var(--space-2);
-  font-size: var(--font-size-xs);
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  font-size: var(--font-size-md);
+}
+
+@media (max-width: 767px) {
+  .room-header {
+    flex-wrap: wrap;
+    padding: var(--space-3);
+  }
+
+  .room-header h2 {
+    flex-basis: 100%;
+  }
+
+  .room-header .header-actions {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: var(--space-1);
+  }
+
+  .queue-panel .track-item {
+    gap: var(--space-2);
+    padding: var(--space-2);
+  }
+
+  .queue-panel .track-item-art {
+    width: 32px;
+    height: 32px;
+  }
 }
 
 .members-list {

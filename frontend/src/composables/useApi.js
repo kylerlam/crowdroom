@@ -57,5 +57,6 @@ export async function apiRequest(method, path, body = null, options = {}) {
 
 export const apiGet = (path, options) => apiRequest('GET', path, null, options);
 export const apiPost = (path, body = {}, options) => apiRequest('POST', path, body, options);
+export const apiPut = (path, body = {}, options) => apiRequest('PUT', path, body, options);
 export const apiPatch = (path, body = {}, options) => apiRequest('PATCH', path, body, options);
 export const apiDelete = (path, options) => apiRequest('DELETE', path, null, options);

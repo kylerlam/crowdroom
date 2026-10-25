@@ -4,9 +4,22 @@
       <h2 :title="roomName">{{ roomName }}</h2>
       <div class="header-actions">
         <span class="badge">{{ roomCode }}</span>
+        <a href="/profile" target="_blank" rel="noopener" class="btn btn-ghost">Profile</a>
+        <a
+          v-if="isManager && spotifyConnectionKnown"
+          href="/profile"
+          target="_blank"
+          rel="noopener"
+          class="btn btn-ghost btn-icon icon-tooltip spotify-status"
+          :class="{ connected: !spotifyPlaybackRequired }"
+          :aria-label="spotifyPlaybackRequired ? 'Spotify disconnected' : 'Spotify connected'"
+          :data-tooltip="spotifyPlaybackRequired ? 'Disconnected' : 'Connected'"
+        >
+          <i :class="spotifyPlaybackRequired ? 'ph ph-link-break' : 'ph ph-link'" aria-hidden="true"></i>
+        </a>
         <button
           v-if="isHost"
-          class="btn btn-ghost"
+          class="btn btn-ghost btn-icon"
           title="Show invite QR"
           @click="openQRModal"
         >
@@ -24,12 +37,14 @@
           <i class="ph ph-play"></i>
           <button
             class="btn btn-primary"
-            :disabled="!isManager || resuming || spotifyPlaybackRequired"
-            :aria-describedby="spotifyPlaybackRequired ? 'spotify-authorization-required' : undefined"
+            :disabled="!isManager || resuming"
             :title="isManager ? 'Resume playback' : 'Only room managers can resume playback'"
             @click="resumePlayback"
           >Resume</button>
-          <p v-if="queueItems.length === 0">{{ EMPTY_QUEUE_MESSAGE }}</p>
+          <p v-if="showEmptyQueuePrompt && queueItems.length === 0" class="empty-queue-prompt" role="status">
+            <span>Add a song first</span>
+            <span class="empty-queue-face">ლ(´•д• ̀ლ</span>
+          </p>
         </div>
         <div v-else>
           <img
@@ -71,14 +86,32 @@
             </button>
           </div>
         </div>
-        <div v-if="spotifyPlaybackRequired" id="spotify-authorization-required" class="spotify-playback-notice" role="status">
-          <p>{{ isHost
-            ? 'Connect your Spotify account to enable playback.'
-            : 'The room host must connect Spotify to enable playback.' }}</p>
-          <a v-if="isHost" href="/profile" target="_blank" rel="noopener" class="btn btn-secondary">
-            Connect Spotify
-          </a>
-        </div>
+        <details v-if="isManager && spotifyConnectionKnown && !spotifyPlaybackRequired" class="spotify-device-panel" @toggle="onDevicesToggle">
+          <summary><i class="ph ph-speaker-high" aria-hidden="true"></i> Playback device</summary>
+          <div class="spotify-device-controls">
+            <label for="spotify-device">Spotify device</label>
+            <select
+              id="spotify-device"
+              v-model="selectedDeviceId"
+              class="input"
+              :disabled="devicesLoading || deviceSelecting || !availableDevices.length"
+              @change="selectSpotifyDevice"
+            >
+              <option value="" disabled>Select a device</option>
+              <option v-for="device in availableDevices" :key="device.id" :value="device.id">
+                {{ device.name }}{{ device.is_active ? ' (active)' : '' }}
+              </option>
+            </select>
+            <button class="btn btn-secondary" :disabled="devicesLoading || deviceSelecting" @click="loadSpotifyDevices">
+              <i class="ph ph-arrow-clockwise" aria-hidden="true"></i> Refresh devices
+            </button>
+          </div>
+          <p v-if="deviceError" class="error-text" role="status">{{ deviceError }}</p>
+          <p v-else-if="!devicesLoading && !availableDevices.length" class="text-tertiary spotify-device-help" role="status">
+            No Spotify devices are available. Keep Spotify open, then refresh devices.
+          </p>
+          <a href="https://open.spotify.com/" target="_blank" rel="noopener" class="spotify-device-link">Open Spotify</a>
+        </details>
       </section>
 
       <!-- Queue -->
@@ -101,22 +134,29 @@
                 </span>
                 <template v-if="isManager">
                   <button
-                    class="btn btn-ghost queue-pin"
+                    class="btn btn-ghost queue-pin icon-tooltip"
                     :class="{ active: item.is_pinned }"
                     :aria-label="`${item.is_pinned ? 'Unpin' : 'Pin'} ${item.song.title}`"
                     :aria-pressed="!!item.is_pinned"
                     :disabled="queueBusyIds.has(item.id) || (!item.is_pinned && pinnedCount >= 5)"
-                    :title="item.is_pinned ? 'Unpin' : pinnedCount >= 5 ? 'Maximum 5 pinned songs' : 'Pin'"
+                    :data-tooltip="item.is_pinned ? 'Unpin' : pinnedCount >= 5 ? 'Maximum 5 pinned songs' : 'Pin'"
                     @click="setQueuePin(item)"
-                  >{{ item.is_pinned ? 'Unpin' : 'Pin' }}</button>
+                  ><i :class="item.is_pinned ? 'ph ph-push-pin-slash' : 'ph ph-push-pin'" aria-hidden="true"></i></button>
                   <button
                     v-if="index > 0"
-                    class="btn btn-ghost queue-jump"
+                    class="btn btn-ghost queue-jump icon-tooltip"
                     :aria-label="`Jump ${item.song.title}`"
                     :disabled="queueBusyIds.has(item.id)"
-                    title="Jump to the front of this priority group"
+                    data-tooltip="Jump"
                     @click="jumpQueueItem(item)"
-                  >Jump</button>
+                  ><i class="ph ph-arrow-up" aria-hidden="true"></i></button>
+                  <button
+                    class="btn btn-ghost queue-dequeue icon-tooltip"
+                    :aria-label="`Dequeue ${item.song.title}`"
+                    :disabled="queueBusyIds.has(item.id)"
+                    data-tooltip="Dequeue"
+                    @click="dequeueItem(item)"
+                  ><i class="ph ph-x" aria-hidden="true"></i></button>
                 </template>
               </template>
             </TrackItem>
@@ -413,10 +453,10 @@
 </template>
 
 <script setup>
-import { ref, computed, nextTick, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useRouter, onBeforeRouteLeave } from 'vue-router';
 import QRCode from 'qrcode';
-import { apiGet, apiPost, apiPatch, apiDelete } from '../composables/useApi.js';
+import { apiGet, apiPost, apiPut, apiPatch, apiDelete } from '../composables/useApi.js';
 import { useAuth } from '../composables/useAuth.js';
 import { useWebSocket } from '../composables/useWebSocket.js';
 import { useToast } from '../composables/useToast.js';
@@ -465,7 +505,10 @@ function onSearchToggle(event) {
 
 const isPlaying = ref(false);
 const resuming = ref(false);
-const EMPTY_QUEUE_MESSAGE = 'Add a song first ლ(´•д• ̀ლ';
+const showEmptyQueuePrompt = ref(false);
+watch(() => queueItems.value.length, (length) => {
+  if (length) showEmptyQueuePrompt.value = false;
+});
 const hasVotedSkip = ref(false);
 const voteOnCooldown = ref(false);
 const playbackPositionMs = ref(0);
@@ -475,6 +518,13 @@ let progressStartTime = null;
 
 const spotifyBanner = ref(null);
 const spotifyPlaybackRequired = ref(false);
+const spotifyConnectionKnown = ref(false);
+const spotifyDevices = ref([]);
+const availableDevices = computed(() => spotifyDevices.value.filter((device) => device.id && !device.is_restricted));
+const selectedDeviceId = ref('');
+const devicesLoading = ref(false);
+const deviceSelecting = ref(false);
+const deviceError = ref('');
 const addingIds = ref(new Set());
 
 const showLeaveModal = ref(false);
@@ -626,7 +676,7 @@ async function loadRoom() {
   isHost.value = room.host_user_id === userId.value;
   hostUserId.value = room.host_user_id;
   adminUserIds.value = room.admin_user_ids || [];
-  if (isHost.value) await checkSpotifyConnection();
+  if (isManager.value) await checkSpotifyConnection();
 }
 
 async function loadSession() {
@@ -675,6 +725,21 @@ function jumpQueueItem(item) {
 
 function setQueuePin(item) {
   return reorderQueueItem(item, !item.is_pinned);
+}
+
+async function dequeueItem(item) {
+  if (!isManager.value || queueBusyIds.value.has(item.id)) return;
+  queueBusyIds.value = new Set(queueBusyIds.value).add(item.id);
+  try {
+    await apiDelete(`/queue/${item.id}`);
+    await loadQueue();
+  } catch (err) {
+    showToast(err.detail || 'Could not remove song');
+  } finally {
+    const next = new Set(queueBusyIds.value);
+    next.delete(item.id);
+    queueBusyIds.value = next;
+  }
 }
 
 async function loadCurrentSong() {
@@ -838,26 +903,63 @@ function startProgressAnimation() {
 }
 
 async function checkSpotifyConnection() {
+  if (!isManager.value) return;
   try {
-    const [connections, { has_credentials }] = await Promise.all([
-      apiGet('/platform-connections/'),
-      apiGet('/platform-connections/spotify/has-app-credentials'),
-    ]);
-    spotifyPlaybackRequired.value = !connections.some((conn) =>
-      conn.platform === 'spotify'
-      && conn.connection_type === 'authorization_code'
-      && !!conn.token_expires_at,
-    );
-    spotifyBanner.value = has_credentials ? null : {
-      message: 'Set up Spotify in your profile to enable search',
-    };
+    const { authorized } = await apiGet('/playback/spotify/status');
+    spotifyPlaybackRequired.value = !authorized;
+    spotifyConnectionKnown.value = true;
+    if (isHost.value) {
+      const { has_credentials } = await apiGet('/platform-connections/spotify/has-app-credentials');
+      spotifyBanner.value = has_credentials ? null : {
+        message: 'Set up Spotify in your profile to enable search',
+      };
+    }
+    if (authorized) await loadSpotifyDevices();
   } catch {
-    // ignore
+    // Keep the last known status when Spotify is temporarily unavailable.
   }
 }
 
 function refreshSpotifyConnection() {
-  if (isHost.value) return checkSpotifyConnection();
+  if (isManager.value) return checkSpotifyConnection();
+}
+
+function onDevicesToggle(event) {
+  if (event.target.open) loadSpotifyDevices();
+}
+
+async function loadSpotifyDevices() {
+  if (!isManager.value || spotifyPlaybackRequired.value || devicesLoading.value) return;
+  devicesLoading.value = true;
+  deviceError.value = '';
+  try {
+    const { devices, selected_device_id } = await apiGet('/playback/devices');
+    spotifyDevices.value = devices;
+    selectedDeviceId.value = selected_device_id || devices.find((device) => device.is_active && !device.is_restricted)?.id || '';
+  } catch (err) {
+    if (err.code === 'SPOTIFY_AUTH_REQUIRED') {
+      spotifyPlaybackRequired.value = true;
+      spotifyConnectionKnown.value = true;
+    } else {
+      deviceError.value = err.detail || 'Could not load Spotify devices. Try refreshing.';
+    }
+  } finally {
+    devicesLoading.value = false;
+  }
+}
+
+async function selectSpotifyDevice() {
+  if (!isManager.value || !selectedDeviceId.value || deviceSelecting.value) return;
+  deviceSelecting.value = true;
+  try {
+    await apiPut('/playback/device', { device_id: selectedDeviceId.value });
+    showToast('Playback device selected', 'success');
+  } catch (err) {
+    handlePlaybackError(err);
+  } finally {
+    deviceSelecting.value = false;
+    await loadSpotifyDevices();
+  }
 }
 
 function debouncedSearch() {
@@ -960,7 +1062,16 @@ async function togglePlayPause() {
 }
 
 async function resumePlayback() {
-  if (!isManager.value || spotifyPlaybackRequired.value || resuming.value || queueItems.value.length === 0) return;
+  if (!isManager.value || resuming.value) return;
+  if (queueItems.value.length === 0) {
+    showEmptyQueuePrompt.value = true;
+    return;
+  }
+  showEmptyQueuePrompt.value = false;
+  if (spotifyPlaybackRequired.value) {
+    showToast(isHost.value ? 'Connect Spotify from the link icon above.' : 'The room host must connect Spotify.');
+    return;
+  }
   resuming.value = true;
   try {
     await apiPost('/playback/play', {});
@@ -983,7 +1094,12 @@ async function hostSkip() {
 }
 
 function handlePlaybackError(err) {
-  if (err.code === 'SPOTIFY_AUTH_REQUIRED') spotifyPlaybackRequired.value = true;
+  if (err.code === 'SPOTIFY_AUTH_REQUIRED') {
+    spotifyPlaybackRequired.value = true;
+    spotifyConnectionKnown.value = true;
+  } else {
+    loadSpotifyDevices();
+  }
   const msg = err.detail || 'Playback control failed';
   showToast(msg);
 }
@@ -1064,10 +1180,19 @@ function setupWebSocket() {
   register('member_joined', refreshMembers);
   register('member_left', refreshMembers);
   register('admins_updated', (msg) => {
+    const wasManager = isManager.value;
     adminUserIds.value = msg.payload?.admin_user_ids || [];
+    if (!wasManager && isManager.value) checkSpotifyConnection();
+    if (!isManager.value) {
+      spotifyConnectionKnown.value = false;
+      spotifyDevices.value = [];
+    }
   });
   register('oauth_required', () => {
-    spotifyPlaybackRequired.value = true;
+    if (isManager.value) {
+      spotifyPlaybackRequired.value = true;
+      spotifyConnectionKnown.value = true;
+    }
     isPlaying.value = false;
     if (progressFrame) cancelAnimationFrame(progressFrame);
   });
