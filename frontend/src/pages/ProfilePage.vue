@@ -97,6 +97,9 @@
                   Connected
                 </p>
                 <p v-else class="text-secondary connection-status">Not connected</p>
+                <p v-if="!spotifyConnected && hasAppCredentials" class="text-secondary">
+                  Authorize your Spotify account to enable playback.
+                </p>
               </div>
             </div>
             <div class="connection-actions">
@@ -114,7 +117,7 @@
               </template>
               <template v-else-if="hasAppCredentials">
                 <button class="btn btn-primary" :disabled="spotifyLoading" @click="connectSpotify">
-                  {{ spotifyLoading ? 'Connecting…' : 'Connect' }}
+                  {{ spotifyLoading ? 'Connecting…' : 'Connect Spotify' }}
                 </button>
                 <button class="btn btn-ghost" @click="showSpotifySetup = true">Change App</button>
               </template>
@@ -227,7 +230,11 @@ onMounted(async () => {
 async function loadConnections() {
   try {
     const connections = await apiGet('/platform-connections/');
-    spotifyConnected.value = connections.some((conn) => conn.platform === 'spotify');
+    spotifyConnected.value = connections.some((conn) =>
+      conn.platform === 'spotify'
+      && conn.connection_type === 'authorization_code'
+      && !!conn.token_expires_at,
+    );
     if (!spotifyConnected.value) {
       const { has_credentials } = await apiGet('/platform-connections/spotify/has-app-credentials');
       hasAppCredentials.value = has_credentials;
@@ -306,8 +313,7 @@ async function uploadAvatar(event) {
 async function disconnectSpotify() {
   try {
     await apiDelete('/platform-connections/spotify');
-    spotifyConnected.value = false;
-    hasAppCredentials.value = false;
+    await loadConnections();
     showToast('Spotify disconnected');
   } catch (err) {
     showToast(err.detail || 'Failed to disconnect');

@@ -39,6 +39,7 @@ vi.mock('../composables/useWebSocket.js', () => ({
 let wrapper;
 let room;
 let pending;
+let connections;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -46,7 +47,10 @@ beforeEach(() => {
   mocks.userId.value = 'owner';
   room = { host_user_id: 'owner', admin_user_ids: ['admin'], room_name: 'Music room', room_code: 'ABC' };
   pending = [];
+  connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: '2099-01-01T00:00:00' }];
   mocks.apiGet.mockImplementation(async (path) => {
+    if (path === '/platform-connections/') return connections;
+    if (path === '/platform-connections/spotify/has-app-credentials') return { has_credentials: true };
     if (path === '/rooms/room') return room;
     if (path === '/session/by-room/room') return { id: 'session' };
     if (path === '/rooms/room/playback') return { status: 'stopped' };
@@ -101,6 +105,32 @@ describe('room administrator controls', () => {
 });
 
 describe('idle playback recovery', () => {
+  it('requires account authorization for playback while keeping app-credential search available', async () => {
+    connections = [{ platform: 'spotify', connection_type: 'client_credentials', token_expires_at: null }];
+    await renderRoom();
+    expect(wrapper.text()).toContain('Connect your Spotify account to enable playback.');
+    expect(wrapper.get('a[href="/profile"]').attributes('target')).toBe('_blank');
+    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('input[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('refreshes authorization when returning from the profile tab', async () => {
+    connections = [];
+    await renderRoom();
+    connections = [{ platform: 'spotify', connection_type: 'authorization_code', token_expires_at: '2020-01-01T00:00:00' }];
+    window.dispatchEvent(new Event('focus'));
+    await flushPromises();
+    expect(wrapper.find('#spotify-authorization-required').exists()).toBe(false);
+    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('shows authorization recovery when Spotify OAuth becomes unavailable', async () => {
+    await renderRoom();
+    mocks.handlers.get('oauth_required')({});
+    await flushPromises();
+    expect(wrapper.find('#spotify-authorization-required').exists()).toBe(true);
+    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
+  });
   it('shows the exact empty queue prompt without calling play', async () => {
     await renderRoom();
     expect(wrapper.text()).toContain('Add a song first ლ(´•д• ̀ლ');

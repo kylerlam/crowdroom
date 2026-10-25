@@ -129,6 +129,14 @@
   gap: var(--space-4);
 }
 
+.spotify-playback-notice {
+  display: grid;
+  justify-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  text-align: center;
+}
+
 .playback-controls .btn-icon {
   width: 44px;
   height: 44px;

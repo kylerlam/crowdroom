@@ -24,7 +24,8 @@
           <i class="ph ph-play"></i>
           <button
             class="btn btn-primary"
-            :disabled="!isManager || resuming"
+            :disabled="!isManager || resuming || spotifyPlaybackRequired"
+            :aria-describedby="spotifyPlaybackRequired ? 'spotify-authorization-required' : undefined"
             :title="isManager ? 'Resume playback' : 'Only room managers can resume playback'"
             @click="resumePlayback"
           >Resume</button>
@@ -62,13 +63,21 @@
             </button>
           </div>
           <div v-if="isManager" class="playback-controls">
-            <button class="btn btn-icon" title="Play/Pause" @click="togglePlayPause">
+            <button class="btn btn-icon" title="Play/Pause" :disabled="spotifyPlaybackRequired" @click="togglePlayPause">
               <i :class="isPlaying ? 'ph ph-pause' : 'ph ph-play'"></i>
             </button>
-            <button class="btn btn-icon" title="Skip" @click="hostSkip">
+            <button class="btn btn-icon" title="Skip" :disabled="spotifyPlaybackRequired" @click="hostSkip">
               <i class="ph ph-skip-forward"></i>
             </button>
           </div>
+        </div>
+        <div v-if="spotifyPlaybackRequired" id="spotify-authorization-required" class="spotify-playback-notice" role="status">
+          <p>{{ isHost
+            ? 'Connect your Spotify account to enable playback.'
+            : 'The room host must connect Spotify to enable playback.' }}</p>
+          <a v-if="isHost" href="/profile" target="_blank" rel="noopener" class="btn btn-secondary">
+            Connect Spotify
+          </a>
         </div>
       </section>
 
@@ -465,6 +474,7 @@ let progressFrame = null;
 let progressStartTime = null;
 
 const spotifyBanner = ref(null);
+const spotifyPlaybackRequired = ref(false);
 const addingIds = ref(new Set());
 
 const showLeaveModal = ref(false);
@@ -492,6 +502,7 @@ const wsHandlers = [];
 let leaving = false;
 
 onMounted(async () => {
+  window.addEventListener('focus', refreshSpotifyConnection);
   if (!roomId.value) {
     router.push('/rooms');
     return;
@@ -514,6 +525,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  window.removeEventListener('focus', refreshSpotifyConnection);
   teardownWebSocket();
   clearTimeout(searchTimeout);
   if (searchController) searchController.abort();
@@ -827,16 +839,25 @@ function startProgressAnimation() {
 
 async function checkSpotifyConnection() {
   try {
-    const connections = await apiGet('/platform-connections/');
-    const hasSpotify = connections.some((conn) => conn.platform === 'spotify');
-    if (!hasSpotify) {
-      spotifyBanner.value = {
-        message: 'Connect Spotify in your profile to enable search and playback',
-      };
-    }
+    const [connections, { has_credentials }] = await Promise.all([
+      apiGet('/platform-connections/'),
+      apiGet('/platform-connections/spotify/has-app-credentials'),
+    ]);
+    spotifyPlaybackRequired.value = !connections.some((conn) =>
+      conn.platform === 'spotify'
+      && conn.connection_type === 'authorization_code'
+      && !!conn.token_expires_at,
+    );
+    spotifyBanner.value = has_credentials ? null : {
+      message: 'Set up Spotify in your profile to enable search',
+    };
   } catch {
     // ignore
   }
+}
+
+function refreshSpotifyConnection() {
+  if (isHost.value) return checkSpotifyConnection();
 }
 
 function debouncedSearch() {
@@ -939,7 +960,7 @@ async function togglePlayPause() {
 }
 
 async function resumePlayback() {
-  if (!isManager.value || resuming.value || queueItems.value.length === 0) return;
+  if (!isManager.value || spotifyPlaybackRequired.value || resuming.value || queueItems.value.length === 0) return;
   resuming.value = true;
   try {
     await apiPost('/playback/play', {});
@@ -962,6 +983,7 @@ async function hostSkip() {
 }
 
 function handlePlaybackError(err) {
+  if (err.code === 'SPOTIFY_AUTH_REQUIRED') spotifyPlaybackRequired.value = true;
   const msg = err.detail || 'Playback control failed';
   showToast(msg);
 }
@@ -1043,6 +1065,11 @@ function setupWebSocket() {
   register('member_left', refreshMembers);
   register('admins_updated', (msg) => {
     adminUserIds.value = msg.payload?.admin_user_ids || [];
+  });
+  register('oauth_required', () => {
+    spotifyPlaybackRequired.value = true;
+    isPlaying.value = false;
+    if (progressFrame) cancelAnimationFrame(progressFrame);
   });
 
   const handleRemoval = (label) => (msg) => {
