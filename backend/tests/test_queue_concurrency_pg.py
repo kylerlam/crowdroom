@@ -127,7 +127,12 @@ def _ensure_seed_data(pg_engine):
             user = User(id=uid, username="test-user")
             s.add(user)
             s.flush()  # Ensure User exists before Room references it
-            room = Room(id=room_id, host_user_id=uid, room_name="test-room")
+            room = Room(
+                id=room_id,
+                host_user_id=uid,
+                room_name="test-room",
+                room_code="TESTPG",
+            )
             s.add(room)
             s.flush()
             sess = SessionModel(
@@ -389,3 +394,67 @@ class TestPGAdvisoryLockIsolation:
         assert positions == list(range(30)), (
             f"Expected sequential 0..29, got: {positions}"
         )
+
+
+@skip_pg
+class TestPGQueuePinConcurrency:
+    """Verify the pin limit is shared across manual and playlist queues."""
+
+    def test_six_concurrent_pin_requests_allow_only_five(self, pg_engine, pg_seed):
+        """Serialize pin-cap checks without dropping any pending queue entries."""
+        from backend.repositories.queue_repo import QueueRepository
+
+        session_id, seed_songs = pg_seed
+        with DBSession(pg_engine) as session:
+            repo = QueueRepository(session)
+            items = [
+                repo.add_to_queue_atomic(
+                    session_id,
+                    song_id,
+                    group="manual" if index % 2 == 0 else "playlist",
+                )
+                for index, song_id in enumerate(seed_songs[:6])
+            ]
+            original_positions = {
+                item.id: (item.group, item.position) for item in items
+            }
+
+        successes, errors = [], []
+        result_lock = threading.Lock()
+        barrier = threading.Barrier(6)
+
+        def pin(item_id):
+            with DBSession(pg_engine) as session:
+                try:
+                    barrier.wait(timeout=10)
+                    QueueRepository(session).prioritize_item(item_id, True)
+                    with result_lock:
+                        successes.append(item_id)
+                except Exception as exc:
+                    with result_lock:
+                        errors.append(exc)
+
+        threads = [
+            threading.Thread(target=pin, args=(item_id,))
+            for item_id in original_positions
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+            assert not thread.is_alive()
+
+        assert len(successes) == 5
+        assert len(errors) == 1
+        assert isinstance(errors[0], ValueError)
+        assert "up to 5" in str(errors[0])
+        with DBSession(pg_engine) as session:
+            items = QueueRepository(session).get_all_by_session(session_id)
+            assert len(items) == 6
+            assert {item.id for item in items if item.is_pinned} == set(successes)
+            assert [item.priority_position for item in items if item.is_pinned] == list(
+                range(5)
+            )
+            assert {item.id: (item.group, item.position) for item in items} == (
+                original_positions
+            )
