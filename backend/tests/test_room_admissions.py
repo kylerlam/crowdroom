@@ -195,6 +195,65 @@ def test_ban_and_capacity_checks_cannot_be_bypassed_by_an_invite(
         )
 
 
+@pytest.mark.parametrize("entrance", ["pin", "invite", "qr"])
+def test_guest_joins_without_approval_and_reentry_keeps_first_wait(
+    admission_room, entrance
+):
+    """Only a real first join starts the guest wait; all entrances share it."""
+    state = admission_room
+    path, body = join_path(state, entrance)
+    with DBSession(state.engine) as db:
+        guest = db.get(User, state.ids["applicant"])
+        guest.is_guest = True
+        guest.guest_name = "Guest Nickname"
+        db.add(guest)
+        db.commit()
+    result = state.client.post(path, json=body)
+    assert result.status_code == 200
+    assert result.json()["status"] == "joined"
+    with DBSession(state.engine) as db:
+        guest = db.get(User, state.ids["applicant"])
+        first_joined = guest.guest_first_joined_at
+        assert first_joined is not None
+        assert RoomAdmissionRepository(db).get(state.room_id, guest.id) is None
+        assert guest.room_id == state.room_id
+    state.notify.assert_not_awaited()
+    assert state.client.post(f"/api/v1/rooms/{state.room_id}/leave").status_code == 200
+    # Reenter using the PIN, including after a single-use invitation was spent.
+    result = state.client.post(
+        f"/api/v1/rooms/{state.room_id}/join", json={"pin": "1234"}
+    )
+    assert result.json()["status"] == "joined"
+    with DBSession(state.engine) as db:
+        assert (
+            db.get(User, state.ids["applicant"]).guest_first_joined_at == first_joined
+        )
+        RoomBanRepository(db).add(state.room_id, state.ids["applicant"])
+    assert (
+        state.client.post(
+            f"/api/v1/rooms/{state.room_id}/join", json={"pin": "1234"}
+        ).status_code
+        == 403
+    )
+
+
+def test_failed_guest_entry_does_not_start_wait(admission_room):
+    state = admission_room
+    with DBSession(state.engine) as db:
+        guest = db.get(User, state.ids["applicant"])
+        guest.is_guest = True
+        db.add(guest)
+        db.commit()
+    assert (
+        state.client.post(
+            f"/api/v1/rooms/{state.room_id}/join", json={"pin": "0000"}
+        ).status_code
+        == 403
+    )
+    with DBSession(state.engine) as db:
+        assert db.get(User, state.ids["applicant"]).guest_first_joined_at is None
+
+
 @pytest.mark.parametrize(
     "credential", ["wrong-pin", "missing-pin", "invalid-token", "expired-token"]
 )

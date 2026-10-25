@@ -92,6 +92,14 @@ def test_owner_cannot_change_own_role_or_promote_nonmember(room_roles):
         anyio.run(service.set_admin, room.id, host.id, uuid4(), True)
 
 
+def test_guest_cannot_receive_administrator_role(room_roles):
+    room, host, _admin, _other_admin, member, service, _manager = room_roles
+    member.is_guest = True
+    with pytest.raises(ForbiddenException, match="Guests cannot"):
+        anyio.run(service.set_admin, room.id, host.id, member.id, True)
+    assert member.id not in room.admin_user_ids
+
+
 def test_manager_must_be_owner_or_current_administrator(room_roles):
     room, host, admin, _other_admin, member, service, _manager = room_roles
 

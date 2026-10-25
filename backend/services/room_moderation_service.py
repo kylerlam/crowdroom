@@ -110,7 +110,7 @@ class RoomModerationService:
         result: list[BannedUserRead] = []
         for ban in bans:
             user = self._user_repo.get_by_id(ban.user_id)
-            username = user.username if user else "(unknown)"
+            username = user.display_name if user else "(unknown)"
             result.append(
                 BannedUserRead(
                     user_id=ban.user_id,
@@ -169,7 +169,7 @@ class RoomModerationService:
                 "type": event_type,
                 "payload": {
                     "user_id": str(target.id),
-                    "username": target.username,
+                    "username": target.display_name,
                 },
             },
             str(room_id),

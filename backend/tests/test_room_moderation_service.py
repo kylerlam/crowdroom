@@ -148,6 +148,7 @@ class TestRoomModerationService:
         ban.created_at = __import__("datetime").datetime(2026, 6, 12, 12, 0, 0)
         mock_ban_repo.list_by_room.return_value = [ban]
         mock_user_repo.get_by_id.return_value = target
+        target.display_name = "victim"
 
         result = service.list_bans(room_id, host_id)
 

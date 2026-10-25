@@ -138,6 +138,10 @@ async def create_room(
     Returns:
         ReadRoom: The newly created room schema.
     """
+    if current_user.is_guest:
+        raise ForbiddenException(
+            "Guests cannot create rooms. Sign in to a registered account."
+        )
     if not current_user.hashed_password:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,

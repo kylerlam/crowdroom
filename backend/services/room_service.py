@@ -99,6 +99,10 @@ class RoomService:
             user.id == user_id and user.room_id == room_id for user in room.users
         ):
             raise EntityNotFoundException("Room membership", user_id)
+        if is_admin and any(
+            user.id == user_id and user.is_guest for user in room.users
+        ):
+            raise ForbiddenException("Guests cannot become room administrators")
 
         admin_ids = list(room.admin_user_ids)
         if is_admin and user_id not in admin_ids:

@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from datetime import datetime, timezone
 from uuid import UUID
 from weakref import WeakValueDictionary
 
@@ -135,7 +136,12 @@ class RoomMembershipService:
             raise UserBannedException()
 
         if user.room_id == room_id:
-            if self._admission_repo.get(room_id, user.id) is None:
+            if user.is_guest and user.guest_first_joined_at is None:
+                user.guest_first_joined_at = datetime.now(timezone.utc)
+                self._user_repo.save(user)
+            elif (
+                not user.is_guest and self._admission_repo.get(room_id, user.id) is None
+            ):
                 self._admission_repo.set_status(room_id, user.id, "approved")
             return self._join_result(room, "joined", user)
 
@@ -164,7 +170,11 @@ class RoomMembershipService:
                         raise ForbiddenException("The PIN you entered is not valid")
 
         admission = self._admission_repo.get(room_id, user.id)
-        if user.id == room.host_user_id:
+        if user.is_guest:
+            # Guest entry has no approval step; PINs, bans and capacity still apply.
+            if user.guest_first_joined_at is None:
+                user.guest_first_joined_at = datetime.now(timezone.utc)
+        elif user.id == room.host_user_id:
             if admission is None or admission.status != "approved":
                 self._admission_repo.set_status(room_id, user.id, "approved")
         elif admission is None:
@@ -184,7 +194,7 @@ class RoomMembershipService:
                 "type": "member_joined",
                 "payload": {
                     "user_id": str(user.id),
-                    "username": user.username,
+                    "username": user.display_name,
                 },
             },
             str(room_id),
@@ -232,7 +242,7 @@ class RoomMembershipService:
         return [
             RoomAdmissionRequest(
                 user_id=entry.user_id,
-                username=entry.user.username,
+                username=entry.user.display_name,
                 public_id=entry.user.public_id,
                 status=entry.status,
             )
@@ -303,7 +313,7 @@ class RoomMembershipService:
                 "type": "member_left",
                 "payload": {
                     "user_id": str(user.id),
-                    "username": user.username,
+                    "username": user.display_name,
                 },
             },
             str(room_id),
