@@ -186,24 +186,33 @@ def test_upgrade_from_public_ids_preserves_accounts_room_queue_and_oauth(
                 scopes="user-modify-playback-state",
             )
         )
+        # Reflect the old schema: current models may gain columns in later revisions.
+        metadata = MetaData()
         tables = [
-            users,
-            Room.__table__,
-            Session.__table__,
-            Song.__table__,
-            QueueItem.__table__,
-            RoomAdmission.__table__,
-            PlatformConnection.__table__,
+            Table(name, metadata, autoload_with=connection)
+            for name in (
+                "users",
+                "rooms",
+                "sessions",
+                "songs",
+                "queue_items",
+                "room_admissions",
+                "platform_connections",
+            )
         ]
         before = {
-            table.name: list(connection.execute(select(table)).mappings())
+            table.name: list(
+                connection.execute(select(table).order_by(table.c.id)).mappings()
+            )
             for table in tables
         }
     command.upgrade(config, "head")
     command.upgrade(config, "head")
     with engine.connect() as connection:
         after = {
-            table.name: list(connection.execute(select(table)).mappings())
+            table.name: list(
+                connection.execute(select(table).order_by(table.c.id)).mappings()
+            )
             for table in tables
         }
         assert after == before

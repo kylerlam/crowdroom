@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 from weakref import WeakValueDictionary
@@ -20,8 +20,10 @@ from backend.core.exceptions import (
     EntityNotFoundException,
     InvalidPlatformCredentialsException,
     SpotifyConnectionRequiredException,
+    SpotifyRateLimitedException,
     SpotifyUpstreamException,
 )
+from backend.core.spotify_rate_limit import assert_ready
 from backend.db.models.enum import ItemStatus, StreamingPlatforms
 from backend.repositories.session_repo import SessionRepository
 from backend.repositories.song_repo import SongRepository
@@ -81,6 +83,13 @@ class PlaybackControlService:
         self._queue_service = queue_service
         self._playback_poller = playback_poller
 
+    def _app_client_id(self, user_id: UUID) -> str | None:
+        """Resolve the host's app so its requests share the correct cooldown."""
+        credentials = self._platform_connection_service.get_spotify_app_credentials(
+            user_id
+        )
+        return credentials.get("client_id") if isinstance(credentials, dict) else None
+
     async def _get_adapter(self, user_id: UUID) -> SpotifyPlaybackAdapter:
         """Obtain a playback adapter with the user's valid access token.
 
@@ -93,7 +102,7 @@ class PlaybackControlService:
         token = await self._platform_connection_service.get_valid_access_token(
             user_id, StreamingPlatforms.SPOTIFY
         )
-        return SpotifyPlaybackAdapter(token)
+        return SpotifyPlaybackAdapter(token, self._app_client_id(user_id))
 
     async def _get_fresh_adapter(self, user_id: UUID) -> SpotifyPlaybackAdapter:
         """Force-refresh token and return a new adapter.
@@ -107,7 +116,7 @@ class PlaybackControlService:
         token = await self._platform_connection_service.force_refresh_token(
             user_id, StreamingPlatforms.SPOTIFY
         )
-        return SpotifyPlaybackAdapter(token)
+        return SpotifyPlaybackAdapter(token, self._app_client_id(user_id))
 
     async def _start_on_device(
         self,
@@ -169,6 +178,7 @@ class PlaybackControlService:
             {
                 "playback_status": ItemStatus.PAUSED,
                 "playback_started_at": None,
+                "playback_sync_hold_until": _utcnow() + timedelta(seconds=15),
                 "playback_position_ms": (
                     self._saved_position(session)
                     if position_ms is None
@@ -208,6 +218,16 @@ class PlaybackControlService:
             room = self._room_service.get_room(session.room_id)
             try:
                 await self._play_locked(room.id, room.host_user_id, next_item.song_id)
+            except SpotifyRateLimitedException as error:
+                await manager.broadcast(
+                    {
+                        "type": "spotify_rate_limited",
+                        "room_id": str(room.id),
+                        "retry_at": error.retry_at.isoformat(),
+                        "retry_after": error.retry_after,
+                    },
+                    str(room.id),
+                )
             except (
                 EntityNotFoundException,
                 InvalidPlatformCredentialsException,
@@ -254,6 +274,7 @@ class PlaybackControlService:
         if device_id is not None:
             self._room_service.assert_host(room_id, user_id)
         host_user_id = room.host_user_id
+        await asyncio.to_thread(assert_ready, self._app_client_id(host_user_id))
 
         session = self._session_repo.get_by_room(room_id, fresh=True)
         if device_id is None and session:
@@ -316,7 +337,11 @@ class PlaybackControlService:
                     f"spotify:track:{song.external_id}",
                     resume_position if is_resume else None,
                 )
-            except SpotifyUpstreamException, httpx.RequestError:
+            except (
+                SpotifyUpstreamException,
+                SpotifyRateLimitedException,
+                httpx.RequestError,
+            ):
                 await self._hold_after_failed_start(
                     room_id, session, resume_position if is_resume else None
                 )
@@ -336,6 +361,7 @@ class PlaybackControlService:
                     "current_device_id": device_id,
                     "playback_started_at": now,
                     "playback_position_ms": resume_position,
+                    "playback_sync_hold_until": None,
                 },
             )
 
@@ -364,6 +390,7 @@ class PlaybackControlService:
         """Pause while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
         host_user_id = room.host_user_id
+        await asyncio.to_thread(assert_ready, self._app_client_id(host_user_id))
         session = self._session_repo.get_by_room(room_id, fresh=True)
         saved_device = session.current_device_id if session else None
         device_id = saved_device if isinstance(saved_device, str) else None
@@ -404,11 +431,16 @@ class PlaybackControlService:
                 {
                     "playback_status": ItemStatus.PAUSED,
                     "playback_position_ms": position,
+                    "playback_sync_hold_until": None,
                 },
             )
         elif session:
             self._session_repo.update(
-                session.id, {"playback_status": ItemStatus.PAUSED}
+                session.id,
+                {
+                    "playback_status": ItemStatus.PAUSED,
+                    "playback_sync_hold_until": None,
+                },
             )
 
         await self._broadcast_state_changed(room_id, "paused")
@@ -431,6 +463,7 @@ class PlaybackControlService:
         """Skip while holding the room's playback lock."""
         room = self._room_service.assert_manager(room_id, user_id)
         host_user_id = room.host_user_id
+        await asyncio.to_thread(assert_ready, self._app_client_id(host_user_id))
 
         session = self._session_repo.get_by_room(room_id, fresh=True)
         if session:
@@ -448,7 +481,11 @@ class PlaybackControlService:
                     saved_device if isinstance(saved_device, str) else None,
                     track_uri,
                 )
-            except SpotifyUpstreamException, httpx.RequestError:
+            except (
+                SpotifyUpstreamException,
+                SpotifyRateLimitedException,
+                httpx.RequestError,
+            ):
                 await self._hold_after_failed_start(room_id, session)
                 raise
             next_item.playback_status = ItemStatus.PLAYING
@@ -460,6 +497,7 @@ class PlaybackControlService:
                     "playback_started_at": _utcnow(),
                     "playback_position_ms": 0,
                     "current_device_id": device_id,
+                    "playback_sync_hold_until": None,
                 },
             )
             await self._broadcast_state_changed(
@@ -517,10 +555,14 @@ class PlaybackControlService:
     def get_spotify_status(self, room_id: UUID, user_id: UUID) -> dict:
         """Expose the host's saved authorization only to room managers."""
         room = self._room_service.assert_manager(room_id, user_id)
+        deadline = self._platform_connection_service.get_spotify_rate_limit_deadline(
+            room.host_user_id
+        )
         return {
             "authorized": self._platform_connection_service.is_spotify_authorized(
                 room.host_user_id
-            )
+            ),
+            "rate_limit_until": deadline,
         }
 
     async def get_devices(self, room_id: UUID, user_id: UUID) -> dict:

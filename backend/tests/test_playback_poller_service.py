@@ -2,6 +2,7 @@
 
 # ruff: noqa: D101, D102
 import asyncio
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
@@ -12,6 +13,12 @@ import pytest
 from backend.adapters.spotify_playback_adapter import SpotifyPlaybackState
 from backend.db.models.enum import ItemStatus
 from backend.services.playback_poller_service import PlaybackPollerService
+
+
+@pytest.fixture(autouse=True)
+def cached_duration_boundary(monkeypatch):
+    """Unit loop tests stub metadata persistence; integration tests use real storage."""
+    monkeypatch.setattr(PlaybackPollerService, "_get_track_duration", lambda *_: None)
 
 
 class TestStartPolling:
@@ -109,9 +116,14 @@ class TestPollLoopTrackChanged:
         mock_session.id = session_id
         mock_session.current_song_id = "old_track"
         mock_session.playback_status = ItemStatus.PLAYING
+        mock_session.playback_position_ms = 180000
+        mock_session.playback_started_at = None
 
         mock_next_item = MagicMock()
         mock_next_item.song.external_id = "new_track"
+        current_item = MagicMock()
+        current_item.song.external_id = "old_track"
+        current_item.song.duration = 180
 
         call_count = 0
 
@@ -155,7 +167,7 @@ class TestPollLoopTrackChanged:
                 patch.object(
                     poller,
                     "_get_current_queue_item",
-                    return_value=None,
+                    return_value=current_item,
                 ),
                 patch.object(
                     poller,
@@ -195,7 +207,7 @@ class TestPollLoopTrackChanged:
         def get_session_side_effect(rid):
             nonlocal call_count
             call_count += 1
-            if call_count <= 1:
+            if call_count <= 2:
                 return mock_session
             return None
 
@@ -240,7 +252,7 @@ class TestPollLoopTrackChanged:
                 patch.object(
                     poller,
                     "_adopt_external_track",
-                ),
+                ) as adopt,
                 patch.object(
                     poller,
                     "_advance_queue",
@@ -250,6 +262,9 @@ class TestPollLoopTrackChanged:
                 await poller._poll_loop(room_id, host_user_id)
 
             mock_advance.assert_not_called()
+            adopt.assert_called_once_with(
+                mock_session, mock_adapter.get_current_playback.return_value
+            )
 
         anyio.run(_run)
 
@@ -392,7 +407,6 @@ class TestPollLoopNoDevice:
     def test_idle_player_with_available_device_advances_queue(
         self, mock_settings, mock_adapter_cls
     ):
-        from datetime import datetime, timedelta
 
         mock_settings.PLAYBACK_POLL_INTERVAL_SECONDS = 0
 
@@ -658,7 +672,6 @@ def test_last_queue_track_album_followup_stops_but_manual_switch_is_adopted(
     elapsed_seconds, natural_end
 ):
     """Album playback cannot carry on after the room's final queued song finishes."""
-    from datetime import datetime, timedelta, timezone
 
     from backend.db.models.session import Session
 
@@ -696,7 +709,13 @@ def test_last_queue_track_album_followup_stops_but_manual_switch_is_adopted(
                 "backend.services.playback_poller_service.SpotifyPlaybackAdapter",
                 return_value=adapter,
             ),
-            patch.object(poller, "_get_session_state", side_effect=[session, None]),
+            patch.object(
+                poller,
+                "_get_session_state",
+                side_effect=(
+                    [session, None] if natural_end else [session, session, None]
+                ),
+            ),
             patch.object(
                 poller, "_get_valid_token", new=AsyncMock(return_value="token")
             ),
@@ -725,7 +744,7 @@ def test_last_queue_track_album_followup_stops_but_manual_switch_is_adopted(
                 playback_service.finish_song.assert_not_awaited()
             else:
                 advance.assert_not_awaited()
-                playback_service.finish_song.assert_awaited_once_with(session.id)
+                playback_service.finish_song.assert_not_awaited()
                 adopt.assert_called_once_with(
                     session, adapter.get_current_playback.return_value
                 )
@@ -884,6 +903,8 @@ class TestPollLoopExternalEndsWithQueuedWaiting:
         mock_session.id = session_id
         mock_session.current_song_id = "external_x"
         mock_session.playback_status = ItemStatus.PLAYING
+        mock_session.playback_position_ms = 180000
+        mock_session.playback_started_at = None
 
         waiting_item = MagicMock()
         waiting_item.song.external_id = "queued_y"
@@ -923,6 +944,7 @@ class TestPollLoopExternalEndsWithQueuedWaiting:
                     return_value="token",
                 ),
                 patch.object(poller, "_get_next_queue_item", return_value=None),
+                patch.object(poller, "_get_track_duration", return_value=180),
                 patch.object(
                     poller, "_get_current_queue_item", return_value=waiting_item
                 ),
@@ -964,9 +986,12 @@ class TestPollLoopAutoplayOverridesQueue:
         mock_session.id = session_id
         mock_session.current_song_id = "queued_a"
         mock_session.playback_status = ItemStatus.PLAYING
+        mock_session.playback_position_ms = 180000
+        mock_session.playback_started_at = None
 
         current_item = MagicMock()
         current_item.song.external_id = "queued_a"
+        current_item.song.duration = 180
         next_item = MagicMock()
         next_item.song.external_id = "queued_b"
 

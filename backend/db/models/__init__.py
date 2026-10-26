@@ -23,4 +23,5 @@ from .room_ban import RoomBan as RoomBan
 from .room_invite import RoomInvite as RoomInvite
 from .session import Session as Session
 from .song import Song as Song
+from .spotify_api_cooldown import SpotifyAPICooldown as SpotifyAPICooldown
 from .user import User as User

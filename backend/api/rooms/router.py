@@ -5,6 +5,9 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from backend.api.auth.dependencies import get_current_user
+from backend.api.platform_connections.dependencies import (
+    get_platform_connection_service,
+)
 from backend.api.queue.dependencies import get_queue_history_repo
 from backend.api.rooms.dependencies import (
     get_room_membership_service,
@@ -36,6 +39,7 @@ from backend.schemas.room import (
     UpdateRoomAdmission,
 )
 from backend.schemas.user import UserRead
+from backend.services.platform_connection_service import PlatformConnectionService
 from backend.services.room_membership_service import RoomMembershipService
 from backend.services.room_moderation_service import RoomModerationService
 from backend.services.room_service import RoomService
@@ -446,6 +450,10 @@ async def get_room_playback(
     room_id: UUID,
     current_user: User = Depends(get_current_user),
     session_repo: SessionRepository = Depends(get_session_repo),
+    room_service: RoomService = Depends(get_room_service),
+    platform_service: PlatformConnectionService = Depends(
+        get_platform_connection_service
+    ),
 ) -> dict:
     """Get playback timing info for syncing progress bars.
 
@@ -456,13 +464,19 @@ async def get_room_playback(
         room_id: The room whose playback state to retrieve.
         current_user: Authenticated user.
         session_repo: The injected session repository.
+        room_service: Enforces current room membership.
+        platform_service: Reads the host app's shared cooldown.
 
     Returns:
         Dictionary with playback timing fields.
     """
+    room = room_service.assert_member(room_id, current_user.id)
+    rate_limit_until = platform_service.get_spotify_rate_limit_deadline(
+        room.host_user_id
+    )
     session = session_repo.get_by_room(room_id)
     if not session:
-        return {"status": "stopped"}
+        return {"status": "stopped", "rate_limit_until": rate_limit_until}
 
     from datetime import datetime, timezone
 
@@ -485,4 +499,5 @@ async def get_room_playback(
         "status": playback_status,
         "elapsed_ms": elapsed_ms,
         "current_song_id": session.current_song_id,
+        "rate_limit_until": rate_limit_until,
     }

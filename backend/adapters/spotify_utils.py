@@ -5,6 +5,7 @@ import base64
 import httpx
 
 from backend.core.exceptions import InvalidPlatformCredentialsException
+from backend.core.spotify_rate_limit import spotify_request
 
 
 async def request_token(credentials: dict[str, str]) -> dict:
@@ -34,7 +35,9 @@ async def request_token(credentials: dict[str, str]) -> dict:
     authorization_header = f"Basic {authorization_base64}"
 
     async with httpx.AsyncClient() as client:
-        response = await client.post(
+        response = await spotify_request(
+            client.post,
+            client_id=client_id,
             url="https://accounts.spotify.com/api/token",
             headers={"Authorization": authorization_header},
             data={"grant_type": "client_credentials"},

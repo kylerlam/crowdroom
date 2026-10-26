@@ -1,5 +1,6 @@
 """Schemas for playback lifecycle responses."""
 
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -38,6 +39,7 @@ class SpotifyStatusResponse(BaseModel):
     """Whether the room host has saved Spotify account authorization."""
 
     authorized: bool
+    rate_limit_until: datetime | None = None
 
 
 class SpotifyDeviceResponse(BaseModel):

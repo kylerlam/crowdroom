@@ -2,11 +2,12 @@
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import httpx
 from sqlmodel import Session as DBSession
+from sqlmodel import select
 
 from backend.adapters.spotify_playback_adapter import (
     SpotifyPlaybackAdapter,
@@ -17,10 +18,15 @@ from backend.core.config import settings
 from backend.core.exceptions import (
     EntityNotFoundException,
     SpotifyConnectionRequiredException,
+    SpotifyRateLimitedException,
     SpotifyUpstreamException,
 )
+from backend.core.spotify_rate_limit import assert_ready
 from backend.db.database import engine
-from backend.db.models.enum import ItemStatus, StreamingPlatforms
+from backend.db.models.enum import ConnectionType, ItemStatus, StreamingPlatforms
+from backend.db.models.platform_connection import PlatformConnection
+from backend.db.models.room import Room
+from backend.db.models.session import Session as SessionModel
 from backend.db.models.song import Song
 from backend.repositories.platform_connection_repo import PlatformConnectionRepo
 from backend.repositories.queue_history_repo import QueueHistoryRepository
@@ -41,7 +47,31 @@ class PlaybackPollerService:
 
     def __init__(self) -> None:
         self._active_tasks: dict[UUID, asyncio.Task] = {}
+        self._client_ids: dict[UUID, str] = {}
         self._lock = asyncio.Lock()
+
+    async def restore_polling(self) -> None:
+        """Restore observation after restart without sending playback commands."""
+        with DBSession(engine) as db_session:
+            rooms = list(
+                db_session.exec(
+                    select(SessionModel.room_id, Room.host_user_id)
+                    .join(Room, Room.id == SessionModel.room_id)
+                    .join(
+                        PlatformConnection,
+                        PlatformConnection.user_id == Room.host_user_id,
+                    )
+                    .where(
+                        SessionModel.current_platform == StreamingPlatforms.SPOTIFY,
+                        PlatformConnection.platform == StreamingPlatforms.SPOTIFY,
+                        PlatformConnection.connection_type
+                        == ConnectionType.AUTHORIZATION_CODE,
+                        PlatformConnection.refresh_token_encrypted.is_not(None),
+                    )
+                ).all()
+            )
+        for room_id, host_user_id in rooms:
+            await self.start_polling(room_id, host_user_id)
 
     def _get_session_state(self, room_id: UUID):
         """Read the current session for a room from a fresh DB connection.
@@ -57,7 +87,12 @@ class PlaybackPollerService:
             return repo.get_by_room(room_id)
 
     def _update_session_status(
-        self, session_id: UUID, status: ItemStatus, position_ms: int | None = None
+        self,
+        session_id: UUID,
+        status: ItemStatus,
+        position_ms: int | None = None,
+        *,
+        sync_hold: bool = False,
     ) -> None:
         """Update a session's playback_status in a fresh DB connection.
 
@@ -65,6 +100,7 @@ class PlaybackPollerService:
             session_id: The session to update.
             status: The new playback status.
             position_ms: Optional position to retain after a device disconnects.
+            sync_hold: Protect a failed command from briefly retained old context.
         """
         with DBSession(engine) as db_session:
             repo = SessionRepository(db_session)
@@ -77,7 +113,14 @@ class PlaybackPollerService:
                 and current_item.song.external_id == session.current_song_id
             ):
                 current_item.playback_status = status
-            data = {"playback_status": status}
+            data = {
+                "playback_status": status,
+                "playback_sync_hold_until": (
+                    datetime.now(timezone.utc) + timedelta(seconds=15)
+                    if sync_hold
+                    else None
+                ),
+            }
             if position_ms is not None:
                 data["playback_position_ms"] = position_ms
             if status == ItemStatus.PAUSED:
@@ -126,6 +169,7 @@ class PlaybackPollerService:
                 "playback_status": status,
                 "playback_started_at": now_naive,
                 "playback_position_ms": 0,
+                "playback_sync_hold_until": None,
             }
             if device_id:
                 data["current_device_id"] = device_id
@@ -149,6 +193,11 @@ class PlaybackPollerService:
         with DBSession(engine) as db_session:
             repo = PlatformConnectionRepo(db_session)
             service = PlatformConnectionService(repo)
+            credentials = service.get_spotify_app_credentials(host_user_id)
+            if isinstance(credentials, dict) and isinstance(
+                credentials.get("client_id"), str
+            ):
+                self._client_ids[host_user_id] = credentials["client_id"]
             if force_refresh:
                 return await service.force_refresh_token(
                     host_user_id, StreamingPlatforms.SPOTIFY
@@ -185,6 +234,16 @@ class PlaybackPollerService:
             if item is not None:
                 _ = item.song
             return item
+
+    def _get_track_duration(self, external_id: str | None) -> float | None:
+        """Read the last observed external track's duration from cached metadata."""
+        if not external_id:
+            return None
+        with DBSession(engine) as db_session:
+            song = SongRepository(db_session).get_by_external_id(
+                external_id, StreamingPlatforms.SPOTIFY.value
+            )
+            return song.duration if song else None
 
     @staticmethod
     def _queue_owns_current_track(session, queue_item) -> bool:
@@ -278,6 +337,29 @@ class PlaybackPollerService:
         now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
         with DBSession(engine) as db_session:
             repo = SessionRepository(db_session)
+            queue_repo = QueueRepository(db_session)
+            previous = repo.get_by_id(session.id)
+            selected = False
+            for item in queue_repo.get_all_by_session(session.id):
+                if item.song.external_id == state.track_id and not selected:
+                    item.playback_status = (
+                        ItemStatus.PLAYING if state.is_playing else ItemStatus.PAUSED
+                    )
+                    selected = True
+                elif (
+                    previous
+                    and item.song.external_id == previous.current_song_id
+                    and item.playback_status
+                    in {
+                        ItemStatus.NOW_PLAYING,
+                        ItemStatus.PLAYING,
+                        ItemStatus.PAUSED,
+                        ItemStatus.BUFFERING,
+                    }
+                ):
+                    # Observing a phone switch is not a Skip/finish command.
+                    item.playback_status = ItemStatus.QUEUED
+                db_session.add(item)
             repo.update(
                 session.id,
                 {
@@ -285,9 +367,58 @@ class PlaybackPollerService:
                     "playback_status": (
                         ItemStatus.PLAYING if state.is_playing else ItemStatus.PAUSED
                     ),
-                    "playback_started_at": now_naive,
+                    "playback_started_at": now_naive if state.is_playing else None,
                     "playback_position_ms": state.progress_ms or 0,
+                    "playback_sync_hold_until": None,
                 },
+            )
+
+    @staticmethod
+    def _sync_hold_active(session) -> bool:
+        """Retain an unconfirmed command briefly instead of adopting its old context."""
+        until = getattr(session, "playback_sync_hold_until", None)
+        return isinstance(until, datetime) and (
+            until.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+        )
+
+    async def _sync_external_track(
+        self, session, room_id: UUID, state: SpotifyPlaybackState
+    ) -> None:
+        """Follow the selected phone's playback without consuming pending songs."""
+        async with _room_playback_lock(room_id):
+            latest = await asyncio.to_thread(self._get_session_state, room_id)
+            if (
+                latest is None
+                or any(
+                    getattr(latest, field) != getattr(session, field)
+                    for field in (
+                        "current_song_id",
+                        "playback_status",
+                        "playback_started_at",
+                        "current_device_id",
+                    )
+                )
+                or self._sync_hold_active(latest)
+            ):
+                return
+            await asyncio.to_thread(self._adopt_external_track, latest, state)
+            await self._broadcast_state_changed(
+                room_id, "playing" if state.is_playing else "paused", state.track_id
+            )
+            await manager.broadcast(
+                {
+                    "type": "song_changed",
+                    "room_id": str(room_id),
+                    "song": {
+                        "title": state.track_name or "Unknown",
+                        "artist": state.track_artist or "Unknown",
+                        "album_art_url": state.album_art_url,
+                        "external_id": state.track_id,
+                        "duration": (state.duration_ms or 0) / 1000.0,
+                        "platform": "spotify",
+                    },
+                },
+                str(room_id),
             )
 
     async def _advance_queue(
@@ -325,6 +456,7 @@ class PlaybackPollerService:
     ) -> None:
         """Advance using a fresh session while manual controls are serialized."""
         playback_service, queue_service = self._build_playback_service_with_queue()
+        await asyncio.to_thread(assert_ready, self._client_ids.get(host_user_id))
         current_item = queue_service.get_current_song(session.id)
         queue_owns_current = self._queue_owns_current_track(session, current_item)
 
@@ -349,12 +481,19 @@ class PlaybackPollerService:
         if next_uri:
             try:
                 resolved_device = await adapter.play(next_uri, device_id)
-            except SpotifyUpstreamException, httpx.RequestError:
+            except (
+                SpotifyUpstreamException,
+                SpotifyRateLimitedException,
+                httpx.RequestError,
+            ):
                 logger.warning(
                     "Spotify did not confirm next-track playback for room %s", room_id
                 )
                 await asyncio.to_thread(
-                    self._update_session_status, session.id, ItemStatus.PAUSED
+                    self._update_session_status,
+                    session.id,
+                    ItemStatus.PAUSED,
+                    sync_hold=True,
                 )
                 await self._broadcast_state_changed(room_id, "paused")
                 return
@@ -364,11 +503,14 @@ class PlaybackPollerService:
                         token = await self._get_valid_token(
                             host_user_id, force_refresh=True
                         )
-                        adapter = SpotifyPlaybackAdapter(token)
+                        adapter = SpotifyPlaybackAdapter(
+                            token, self._client_ids.get(host_user_id)
+                        )
                         resolved_device = await adapter.play(next_uri, device_id)
                     except (
                         httpx.HTTPStatusError,
                         SpotifyUpstreamException,
+                        SpotifyRateLimitedException,
                         httpx.RequestError,
                     ):
                         logger.warning(
@@ -377,7 +519,10 @@ class PlaybackPollerService:
                             room_id,
                         )
                         await asyncio.to_thread(
-                            self._update_session_status, session.id, ItemStatus.PAUSED
+                            self._update_session_status,
+                            session.id,
+                            ItemStatus.PAUSED,
+                            sync_hold=True,
                         )
                         await self._broadcast_state_changed(room_id, "paused")
                         return
@@ -388,7 +533,10 @@ class PlaybackPollerService:
                         error.response.status_code,
                     )
                     await asyncio.to_thread(
-                        self._update_session_status, session.id, ItemStatus.PAUSED
+                        self._update_session_status,
+                        session.id,
+                        ItemStatus.PAUSED,
+                        sync_hold=True,
                     )
                     await self._broadcast_state_changed(room_id, "paused")
                     return
@@ -412,7 +560,7 @@ class PlaybackPollerService:
         else:
             try:
                 await (adapter.pause(device_id) if device_id else adapter.pause())
-            except httpx.HTTPStatusError:
+            except httpx.HTTPStatusError, SpotifyRateLimitedException:
                 pass
             await asyncio.to_thread(
                 self._update_session_status, session.id, ItemStatus.STOPPED
@@ -516,6 +664,16 @@ class PlaybackPollerService:
             )
         return position_ms
 
+    @staticmethod
+    def _poll_interval(session) -> int:
+        """Observe idle devices less often while retaining prompt active playback."""
+        interval = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+        if session.playback_status == ItemStatus.STOPPED:
+            return interval * 4
+        if session.playback_status in {ItemStatus.PAUSED, None}:
+            return interval * 2
+        return interval
+
     async def _poll_loop(self, room_id: UUID, host_user_id: UUID) -> None:
         """Poll Spotify playback state and reconcile with internal queue.
 
@@ -537,7 +695,9 @@ class PlaybackPollerService:
                         break
 
                     token = await self._get_valid_token(host_user_id)
-                    adapter = SpotifyPlaybackAdapter(token)
+                    adapter = SpotifyPlaybackAdapter(
+                        token, self._client_ids.get(host_user_id)
+                    )
                     try:
                         state = await adapter.get_current_playback()
                     except httpx.HTTPStatusError as error:
@@ -546,7 +706,9 @@ class PlaybackPollerService:
                         token = await self._get_valid_token(
                             host_user_id, force_refresh=True
                         )
-                        adapter = SpotifyPlaybackAdapter(token)
+                        adapter = SpotifyPlaybackAdapter(
+                            token, self._client_ids.get(host_user_id)
+                        )
                         state = await adapter.get_current_playback()
 
                     logger.info(
@@ -581,7 +743,7 @@ class PlaybackPollerService:
                                 await self._pause_if_unchanged(
                                     session, room_id, position_ms
                                 )
-                                backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                                backoff = self._poll_interval(session)
                                 continue
                             devices = await adapter.get_devices()
                             if not any(
@@ -590,7 +752,7 @@ class PlaybackPollerService:
                             ):
                                 # Missing devices are not an end-of-song event.
                                 # Keep the current queue item until Spotify returns.
-                                backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                                backoff = self._poll_interval(session)
                                 continue
                             logger.info(
                                 "Room %s: Spotify idle (was playing), advancing",
@@ -599,7 +761,7 @@ class PlaybackPollerService:
                             await self._advance_queue(
                                 session, room_id, host_user_id, adapter
                             )
-                        backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                        backoff = self._poll_interval(session)
                         continue
 
                     selected_device = session.current_device_id
@@ -612,12 +774,11 @@ class PlaybackPollerService:
                             await self._pause_if_unchanged(
                                 session, room_id, self._estimated_position_ms(session)
                             )
-                        backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                        backoff = self._poll_interval(session)
                         continue
 
                     if state.track_id != session.current_song_id and (
-                        not state.is_playing
-                        or session.playback_status == ItemStatus.PAUSED
+                        not state.is_playing or self._sync_hold_active(session)
                     ):
                         # Spotify can acknowledge Play before its web player has
                         # activated, while still returning the previous paused track.
@@ -626,7 +787,21 @@ class PlaybackPollerService:
                             await self._pause_if_unchanged(
                                 session, room_id, session.playback_position_ms or 0
                             )
-                        backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                        backoff = self._poll_interval(session)
+                        continue
+
+                    if (
+                        state.is_playing
+                        and session.playback_status
+                        in {
+                            ItemStatus.PAUSED,
+                            ItemStatus.STOPPED,
+                            None,
+                        }
+                        and state.track_id != session.current_song_id
+                    ):
+                        await self._sync_external_track(session, room_id, state)
+                        backoff = self._poll_interval(session)
                         continue
 
                     if not state.is_playing and session.playback_status in {
@@ -650,99 +825,40 @@ class PlaybackPollerService:
                             )
                         # Spotify retains the last paused track after a queue
                         # drains. Do not adopt it again or undo an explicit pause.
-                        backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                        backoff = self._poll_interval(session)
                         continue
 
                     if state.track_id != session.current_song_id:
-                        next_item = self._get_next_queue_item(session.id)
-                        next_external_id = (
-                            next_item.song.external_id
-                            if next_item and next_item.song
-                            else None
-                        )
                         current_item = self._get_current_queue_item(session.id)
                         queue_owns_current = self._queue_owns_current_track(
                             session, current_item
                         )
                         current_duration = (
-                            current_item.song.duration if queue_owns_current else None
+                            current_item.song.duration
+                            if queue_owns_current
+                            else self._get_track_duration(session.current_song_id)
                         )
-                        queue_track_ended = (
+                        track_ended = (
                             isinstance(current_duration, (int, float))
                             and current_duration > 0
                             and self._estimated_position_ms(session)
                             >= current_duration * 1000 - 5000
                         )
-
-                        should_advance_with_next = (
-                            state.track_id == next_external_id
-                            or (
-                                queue_owns_current
-                                and (next_item is not None or queue_track_ended)
-                            )
-                        )
-                        should_take_over_with_current = (
-                            current_item is not None and not queue_owns_current
-                        )
-
-                        if should_advance_with_next:
+                        if track_ended and current_item is not None:
                             logger.info(
-                                "Room %s: queue advance triggered "
-                                "(spotify=%s, queue_next=%s, queue_owns=%s)",
+                                "Room %s: observed track end, advancing room queue",
                                 room_id,
-                                state.track_id,
-                                next_external_id,
-                                queue_owns_current,
-                            )
-                            await self._advance_queue(
-                                session, room_id, host_user_id, adapter
-                            )
-                        elif should_take_over_with_current:
-                            logger.info(
-                                "Room %s: external track ended, taking "
-                                "control with queued item %s",
-                                room_id,
-                                current_item.song.external_id
-                                if current_item.song
-                                else None,
                             )
                             await self._advance_queue(
                                 session, room_id, host_user_id, adapter
                             )
                         else:
                             logger.info(
-                                "Room %s: external track detected %s, adopting",
+                                "Room %s: phone track changed to %s, synchronizing",
                                 room_id,
                                 state.track_id,
                             )
-                            if queue_owns_current:
-                                svc, _ = self._build_playback_service_with_queue()
-                                await svc.finish_song(session.id)
-                            await asyncio.to_thread(
-                                self._adopt_external_track,
-                                session,
-                                state,
-                            )
-                            await self._broadcast_state_changed(
-                                room_id,
-                                "playing" if state.is_playing else "paused",
-                                state.track_id,
-                            )
-                            await manager.broadcast(
-                                {
-                                    "type": "song_changed",
-                                    "room_id": str(room_id),
-                                    "song": {
-                                        "title": state.track_name or "Unknown",
-                                        "artist": state.track_artist or "Unknown",
-                                        "album_art_url": state.album_art_url,
-                                        "external_id": state.track_id,
-                                        "duration": (state.duration_ms or 0) / 1000.0,
-                                        "platform": "spotify",
-                                    },
-                                },
-                                str(room_id),
-                            )
+                            await self._sync_external_track(session, room_id, state)
 
                     elif (
                         not state.is_playing
@@ -781,10 +897,11 @@ class PlaybackPollerService:
                             await self._broadcast_state_changed(
                                 room_id, "paused", state.track_id
                             )
-                    elif (
-                        state.is_playing
-                        and session.playback_status == ItemStatus.PAUSED
-                    ):
+                    elif state.is_playing and session.playback_status in {
+                        ItemStatus.PAUSED,
+                        ItemStatus.STOPPED,
+                        None,
+                    }:
                         await asyncio.to_thread(
                             self._update_session_status,
                             session.id,
@@ -794,10 +911,42 @@ class PlaybackPollerService:
                         await self._broadcast_state_changed(
                             room_id, "playing", state.track_id
                         )
-                    backoff = settings.PLAYBACK_POLL_INTERVAL_SECONDS
+                    elif (
+                        state.is_playing
+                        and isinstance(state.progress_ms, int)
+                        and abs(
+                            state.progress_ms - self._estimated_position_ms(session)
+                        )
+                        > 2000
+                    ):
+                        # A seek made on the phone must also move the room progress bar.
+                        await asyncio.to_thread(
+                            self._update_session_status,
+                            session.id,
+                            ItemStatus.PLAYING,
+                            state.progress_ms,
+                        )
+                        await self._broadcast_state_changed(
+                            room_id, "playing", state.track_id
+                        )
+                    backoff = self._poll_interval(session)
 
                 except asyncio.CancelledError:
                     raise
+                except SpotifyRateLimitedException as error:
+                    backoff = max(1, error.retry_after)
+                    await manager.broadcast(
+                        {
+                            "type": "spotify_rate_limited",
+                            "room_id": str(room_id),
+                            "retry_at": error.retry_at.isoformat(),
+                            "retry_after": error.retry_after,
+                        },
+                        str(room_id),
+                    )
+                    logger.warning(
+                        "Spotify requests are cooling down for room %s", room_id
+                    )
                 except httpx.HTTPStatusError as error:
                     if error.response.status_code == 429:
                         retry_after = int(

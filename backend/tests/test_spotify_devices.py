@@ -207,6 +207,7 @@ def manager_client():
     sessions.get_by_room.return_value = session
     connections = MagicMock(spec=PlatformConnectionService)
     connections.is_spotify_authorized.return_value = True
+    connections.get_spotify_rate_limit_deadline.return_value = None
     connections.get_valid_access_token = AsyncMock(return_value="host-token")
     service = PlaybackControlService(
         rooms, sessions, MagicMock(), connections, MagicMock(), MagicMock()
@@ -242,7 +243,7 @@ def test_role_controls_host_status_access_and_owner_device_selection(
     else:
         assert result.status_code == (204 if operation == "select" else 200)
         if operation == "status":
-            assert result.json() == {"authorized": True}
+            assert result.json() == {"authorized": True, "rate_limit_until": None}
             service._platform_connection_service.is_spotify_authorized.assert_called_once_with(
                 host.id
             )
@@ -299,7 +300,8 @@ def test_pause_while_device_offline_still_preserves_manager_intent(manager_clien
     assert result.status_code == 204
     adapter.pause.assert_awaited_once_with("saved")
     service._session_repo.update.assert_called_once_with(
-        session.id, {"playback_status": ItemStatus.PAUSED}
+        session.id,
+        {"playback_status": ItemStatus.PAUSED, "playback_sync_hold_until": None},
     )
     adapter.transfer.assert_not_awaited()
 
@@ -395,6 +397,7 @@ def test_foreign_playback_cannot_consume_a_selected_or_paused_queue(
         current_device_id="iphone",
         playback_status=status,
         playback_position_ms=40000,
+        playback_sync_hold_until=datetime.now(timezone.utc) + timedelta(seconds=15),
     )
     adapter = AsyncMock()
     adapter.get_current_playback.return_value = SpotifyPlaybackState(
@@ -471,7 +474,9 @@ def test_unconfirmed_automatic_start_holds_pending_queue_for_explicit_retry():
             await poller._advance_queue_locked(
                 session, session.room_id, uuid4(), adapter
             )
-            update.assert_called_once_with(session.id, ItemStatus.PAUSED)
+            update.assert_called_once_with(
+                session.id, ItemStatus.PAUSED, sync_hold=True
+            )
             update_track.assert_not_called()
             notify.assert_awaited_once_with(session.room_id, "paused")
             playback_service.finish_song.assert_not_awaited()

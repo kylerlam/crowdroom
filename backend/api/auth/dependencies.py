@@ -2,7 +2,7 @@
 
 from uuid import UUID
 
-from fastapi import Cookie, Depends, HTTPException, status
+from fastapi import Cookie, Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlmodel import Session as DBSession
 
@@ -54,6 +54,7 @@ def get_current_user_unchecked(
     security_service: SecurityService = Depends(get_security_service),
     token: str | None = Depends(oauth2_scheme),
     cookie_token: str | None = Cookie(default=None, alias=settings.AUTH_COOKIE_NAME),
+    request: Request = None,
 ) -> User:
     """Retrieves the current user without profile completeness checks.
 
@@ -68,6 +69,7 @@ def get_current_user_unchecked(
         security_service: The security service instance.
         token: The JWT token extracted from the Authorization header (optional).
         cookie_token: The JWT token extracted from the httpOnly cookie (optional).
+        request: Request context for non-secret room notifications, when available.
 
     Returns:
         The authenticated user model.
@@ -94,6 +96,8 @@ def get_current_user_unchecked(
             raise credentials_exception
         if payload.get("ver") != user.token_version:
             raise credentials_exception
+        if request is not None:
+            request.state.authenticated_room_id = user.room_id
         return user
     except HTTPException:
         raise

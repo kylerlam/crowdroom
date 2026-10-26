@@ -1,5 +1,6 @@
 """Custom application exceptions."""
 
+from datetime import datetime, timezone
 from uuid import UUID
 
 
@@ -269,6 +270,25 @@ class SpotifyUpstreamException(AppException):
             super().__init__(f"Spotify returned HTTP {status_code}")
         else:
             super().__init__(detail)
+
+
+class SpotifyRateLimitedException(AppException):
+    """Spotify requires all calls for this app to wait until a shared deadline."""
+
+    def __init__(self, retry_at: datetime):
+        self.retry_at = (
+            retry_at.replace(tzinfo=timezone.utc)
+            if retry_at.tzinfo is None
+            else retry_at.astimezone(timezone.utc)
+        )
+        super().__init__(
+            "Spotify is temporarily limiting requests. Please wait before trying again."
+        )
+
+    @property
+    def retry_after(self) -> float:
+        """Return the remaining seconds without extending the original deadline."""
+        return max(0, (self.retry_at - datetime.now(timezone.utc)).total_seconds())
 
 
 class InvalidDeviceURLException(AppException):

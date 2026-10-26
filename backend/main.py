@@ -1,6 +1,7 @@
 """Main entry point for the FastAPI application."""
 
 from contextlib import asynccontextmanager
+from math import ceil
 from pathlib import Path
 from uuid import UUID
 
@@ -36,6 +37,7 @@ from backend.core.exceptions import (
     PasswordRequiredException,
     ProfileIncompleteException,
     SpotifyConnectionRequiredException,
+    SpotifyRateLimitedException,
     SpotifyUpstreamException,
     TooManyRequestsException,
     UserAlreadyInRoomException,
@@ -56,6 +58,7 @@ async def lifespan(app: FastAPI):
     print("Creating tables in database...")
     create_db_and_tables()
     app.state.playback_poller = PlaybackPollerService()
+    await app.state.playback_poller.restore_polling()
     yield
     await app.state.playback_poller.stop_all()
     print("App closed.")
@@ -204,6 +207,28 @@ async def spotify_connection_required_handler(
     return JSONResponse(
         status_code=409,
         content={"detail": str(exc), "code": "SPOTIFY_AUTH_REQUIRED"},
+    )
+
+
+@app.exception_handler(SpotifyRateLimitedException)
+async def spotify_rate_limited_handler(
+    request: Request, exc: SpotifyRateLimitedException
+) -> JSONResponse:
+    """Keep Spotify rate limits distinct from application votes and guest quotas."""
+    remaining = exc.retry_after
+    payload = {"retry_at": exc.retry_at.isoformat(), "retry_after": remaining}
+    # Notify the caller's room, without exposing its host authorization or devices.
+    room_id = getattr(request.state, "authenticated_room_id", None)
+    if room_id is not None:
+        from backend.api.websocket import manager
+
+        await manager.broadcast(
+            {"type": "spotify_rate_limited", "payload": payload}, str(room_id)
+        )
+    return JSONResponse(
+        status_code=429,
+        content={"detail": str(exc), "code": "SPOTIFY_RATE_LIMITED", **payload},
+        headers={"Retry-After": str(max(1, ceil(remaining)))},
     )
 
 

@@ -13,6 +13,7 @@ from backend.core.encryption import decrypt_data, encrypt_data
 from backend.core.exceptions import (
     InvalidPlatformCredentialsException,
     SpotifyConnectionRequiredException,
+    SpotifyRateLimitedException,
     SpotifyUpstreamException,
 )
 from backend.db.models import PlatformConnection, User
@@ -163,7 +164,7 @@ def test_only_changing_app_identity_clears_authorization(stored_connection, new_
     [
         (400, "invalid_grant", SpotifyConnectionRequiredException),
         (401, "invalid_client", InvalidPlatformCredentialsException),
-        (429, "rate_limit", SpotifyUpstreamException),
+        (429, "rate_limit", SpotifyRateLimitedException),
         (503, "temporarily_unavailable", SpotifyUpstreamException),
     ],
 )

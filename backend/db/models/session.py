@@ -48,6 +48,9 @@ class Session(SQLModel, table=True):
     playback_position_ms: int | None = Field(None, nullable=True)
     playback_started_at: datetime | None = Field(None, nullable=True)
     current_device_id: str | None = Field(default=None, nullable=True)
+    playback_sync_hold_until: datetime | None = Field(
+        default=None, sa_type=sa.DateTime(timezone=True), nullable=True
+    )
 
     # Relations
     room: "Room" = Relationship(back_populates="session")

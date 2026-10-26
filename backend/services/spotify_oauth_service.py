@@ -13,6 +13,7 @@ from cryptography.fernet import InvalidToken
 from backend.core.config import settings
 from backend.core.encryption import decrypt_data_with_ttl, encrypt_data
 from backend.core.exceptions import OAuthStateException
+from backend.core.spotify_rate_limit import spotify_request
 from backend.db.models import PlatformConnection
 from backend.db.models.enum import StreamingPlatforms
 from backend.schemas.platform_connection import StoreOAuthTokens
@@ -136,7 +137,9 @@ class SpotifyOAuthService:
             httpx.HTTPStatusError: If Spotify rejects the token request.
         """
         async with httpx.AsyncClient() as client:
-            response = await client.post(
+            response = await spotify_request(
+                client.post,
+                client_id=client_id,
                 url=SPOTIFY_TOKEN_URL,
                 data={
                     "grant_type": "authorization_code",

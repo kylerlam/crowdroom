@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import httpx
 
 from backend.core.exceptions import SpotifyUpstreamException
+from backend.core.spotify_rate_limit import spotify_request
 
 
 @dataclass
@@ -27,8 +28,9 @@ class SpotifyPlaybackAdapter:
 
     BASE_URL = "https://api.spotify.com/v1/me/player"
 
-    def __init__(self, access_token: str) -> None:
+    def __init__(self, access_token: str, client_id: str | None = None) -> None:
         self._token = access_token
+        self._client_id = client_id
 
     def _headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self._token}"}
@@ -65,8 +67,11 @@ class SpotifyPlaybackAdapter:
     async def get_devices(self) -> list[dict]:
         """Read currently available Spotify Connect devices without waking them."""
         async with httpx.AsyncClient() as client:
-            response = await client.get(
-                url=self.BASE_URL + "/devices", headers=self._headers()
+            response = await spotify_request(
+                client.get,
+                client_id=self._client_id,
+                url=self.BASE_URL + "/devices",
+                headers=self._headers(),
             )
             response.raise_for_status()
         return [
@@ -83,7 +88,9 @@ class SpotifyPlaybackAdapter:
     async def transfer(self, device_id: str) -> None:
         """Select a device while preserving its current playing or paused state."""
         async with httpx.AsyncClient() as client:
-            response = await client.put(
+            response = await spotify_request(
+                client.put,
+                client_id=self._client_id,
                 url=self.BASE_URL,
                 headers=self._headers(),
                 json={"device_ids": [device_id], "play": False},
@@ -177,7 +184,9 @@ class SpotifyPlaybackAdapter:
                 # Some mobile Connect players accept a URI list without starting it.
                 # An album context plus the track offset starts the same song there.
                 track_id = track_uri.rsplit(":", 1)[-1]
-                track = await client.get(
+                track = await spotify_request(
+                    client.get,
+                    client_id=self._client_id,
                     url="https://api.spotify.com/v1/tracks/" + track_id,
                     headers=self._headers(),
                 )
@@ -210,7 +219,9 @@ class SpotifyPlaybackAdapter:
                 body["position_ms"] = max(0, position_ms)
             for attempt in range(2):
                 kwargs = {"json": body} if body else {}
-                response = await client.put(
+                response = await spotify_request(
+                    client.put,
+                    client_id=self._client_id,
                     url=self.BASE_URL + "/play",
                     headers=self._headers(),
                     params={"device_id": device_id} if device_id else {},
@@ -230,7 +241,9 @@ class SpotifyPlaybackAdapter:
         """
         async with httpx.AsyncClient() as client:
             kwargs = {"params": {"device_id": device_id}} if device_id else {}
-            response = await client.put(
+            response = await spotify_request(
+                client.put,
+                client_id=self._client_id,
                 url=self.BASE_URL + "/pause",
                 headers=self._headers(),
                 **kwargs,
@@ -244,7 +257,9 @@ class SpotifyPlaybackAdapter:
             httpx.HTTPStatusError: If Spotify rejects the request.
         """
         async with httpx.AsyncClient() as client:
-            response = await client.post(
+            response = await spotify_request(
+                client.post,
+                client_id=self._client_id,
                 url=self.BASE_URL + "/next",
                 headers=self._headers(),
             )
@@ -257,7 +272,9 @@ class SpotifyPlaybackAdapter:
             SpotifyPlaybackState if active playback, None if no active device.
         """
         async with httpx.AsyncClient() as client:
-            response = await client.get(
+            response = await spotify_request(
+                client.get,
+                client_id=self._client_id,
                 url=self.BASE_URL,
                 headers=self._headers(),
             )

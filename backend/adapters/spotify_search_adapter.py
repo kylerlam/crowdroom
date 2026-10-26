@@ -8,6 +8,7 @@ import httpx
 from backend.adapters.base import BaseAdapter
 from backend.adapters.cache import get_cached_metadata, set_cached_metadata
 from backend.adapters.spotify_utils import request_token
+from backend.core.spotify_rate_limit import spotify_request
 from backend.db.models.enum import StreamingPlatforms
 from backend.schemas.song_metadata import ReadSongMetadata
 
@@ -66,8 +67,10 @@ class SpotifySearchAdapter(BaseAdapter):
         token = await self._get_access_token()
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(
+            response = await spotify_request(
+                client.get,
                 "https://api.spotify.com/v1/search",
+                client_id=self._client_id,
                 headers={"Authorization": f"Bearer {token}"},
                 params={"q": query, "type": "track", "limit": 10},
             )
@@ -97,8 +100,10 @@ class SpotifySearchAdapter(BaseAdapter):
         token = await self._get_access_token()
 
         async with httpx.AsyncClient() as client:
-            response = await client.get(
+            response = await spotify_request(
+                client.get,
                 f"https://api.spotify.com/v1/tracks/{external_id}",
+                client_id=self._client_id,
                 headers={"Authorization": f"Bearer {token}"},
             )
 

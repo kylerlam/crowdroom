@@ -17,6 +17,7 @@ from backend.core.exceptions import (
     SpotifyConnectionRequiredException,
     SpotifyUpstreamException,
 )
+from backend.core.spotify_rate_limit import get_deadline, spotify_request
 from backend.db.models import PlatformConnection, StreamingPlatforms
 from backend.db.models.enum import ConnectionType
 from backend.repositories.platform_connection_repo import PlatformConnectionRepo
@@ -312,7 +313,9 @@ class PlatformConnectionService:
 
         async with httpx.AsyncClient() as client:
             try:
-                response = await client.post(
+                response = await spotify_request(
+                    client.post,
+                    client_id=client_id,
                     url="https://accounts.spotify.com/api/token",
                     data={
                         "grant_type": "refresh_token",
@@ -379,3 +382,11 @@ class PlatformConnectionService:
                 "PlatformConnection", f"{user_id}:{platform.value}"
             )
         self._repo.delete(connection.id)
+
+    def get_spotify_rate_limit_deadline(self, user_id: UUID) -> datetime | None:
+        """Read the host app's shared cooldown without contacting Spotify."""
+        credentials = self.get_spotify_app_credentials(user_id)
+        client_id = (
+            credentials.get("client_id") if isinstance(credentials, dict) else None
+        )
+        return get_deadline(client_id)
