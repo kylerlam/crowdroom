@@ -125,7 +125,7 @@ class InviteQRService:
             ) from exc
 
     def _build_join_url(self, token: str) -> str:
-        base = self._settings.FRONTEND_URL.rstrip("/")
+        base = (self._settings.PUBLIC_URL or self._settings.FRONTEND_URL).rstrip("/")
         return f"{base}/invite?token={token}"
 
     @staticmethod

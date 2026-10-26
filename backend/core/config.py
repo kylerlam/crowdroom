@@ -4,7 +4,13 @@ import logging
 from pathlib import Path
 from typing import Literal
 
-from pydantic import PrivateAttr, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    PrivateAttr,
+    TypeAdapter,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from backend.core.network import IPNetwork, parse_ip_networks
@@ -98,6 +104,8 @@ class Settings(BaseSettings):
     PLAYBACK_POLL_INTERVAL_SECONDS: int = 3
     SPOTIFY_OAUTH_STATE_TTL_SECONDS: int = 600
     FRONTEND_URL: str = "http://localhost:8000"
+    # Optional browser-facing origin for shared links; OAuth keeps FRONTEND_URL.
+    PUBLIC_URL: str = ""
 
     # Shared secret sent as X-Device-Token to LAN QR display devices.
     DEVICE_AUTH_TOKEN: str = ""
@@ -125,6 +133,26 @@ class Settings(BaseSettings):
     def docs_allowed_networks(self) -> list[IPNetwork]:
         """Networks allowed to reach the API docs (parsed once at startup)."""
         return self._docs_allowed_networks
+
+    @field_validator("PUBLIC_URL")
+    @classmethod
+    def _validate_public_url(cls, value: str) -> str:
+        """Accept a configured share origin without credentials, paths or queries."""
+        if not value.strip():
+            return ""
+        url = TypeAdapter(AnyHttpUrl).validate_python(value.strip())
+        if (
+            url.username is not None
+            or url.password is not None
+            or url.path not in (None, "/")
+            or url.query is not None
+            or url.fragment is not None
+        ):
+            raise ValueError(
+                "PUBLIC_URL must be an HTTP(S) origin without credentials, "
+                "path, query or fragment"
+            )
+        return str(url).rstrip("/")
 
     @model_validator(mode="after")
     def _resolve_docs_allowed_networks(self) -> "Settings":

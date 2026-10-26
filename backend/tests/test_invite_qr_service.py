@@ -59,11 +59,13 @@ class _FakeAsyncClient:
 def _settings(
     frontend_url: str = "http://localhost:8000",
     device_auth_token: str = "",
+    public_url: str = "",
 ) -> Settings:
     return Settings(
         SECRET_KEY="x",
         ENCRYPTION_KEY="x" * 32,
         FRONTEND_URL=frontend_url,
+        PUBLIC_URL=public_url,
         DEVICE_AUTH_TOKEN=device_auth_token,
     )
 
@@ -128,6 +130,21 @@ class TestCreateQRInvite:
 
         with pytest.raises(ForbiddenException):
             service.create_qr_invite(room_id, host_user_id)
+
+    def test_public_origin_is_shared_while_host_oauth_origin_stays_local(
+        self, mock_invite_service, mock_room_service, host_user_id, room_id
+    ):
+        mock_invite_service.create_invite.return_value = self._stub_invite("tok")
+        config = _settings(
+            frontend_url="http://127.0.0.1:8000",
+            public_url="http://192.168.1.20:8000/",
+        )
+        service = InviteQRService(mock_invite_service, mock_room_service, config)
+
+        result = service.create_qr_invite(room_id, host_user_id)
+
+        assert result.url == "http://192.168.1.20:8000/invite?token=tok"
+        assert config.FRONTEND_URL == "http://127.0.0.1:8000"
 
 
 class TestSendToDevice:
