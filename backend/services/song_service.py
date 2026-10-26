@@ -56,6 +56,10 @@ class SongService:
         """
         return self._song_repo.get_by_external_id(external_id, platform)
 
+    def search_saved(self, query: str, platform: str) -> list[Song]:
+        """Search the saved catalog while the external platform is unavailable."""
+        return self._song_repo.search_saved(query, platform)
+
     def get_or_create_song(self, song_data: CreateSong) -> Song:
         """Retrieve an existing song or create a new one.
 

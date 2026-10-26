@@ -4,7 +4,7 @@ from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session as DBSession
-from sqlmodel import select
+from sqlmodel import or_, select
 
 from backend.db.models.song import Song
 
@@ -75,6 +75,26 @@ class SongRepository:
             list[Song]: A list of all songs.
         """
         return list(self._session.exec(select(Song)).all())
+
+    def search_saved(self, query: str, platform: str) -> list[Song]:
+        """Find at most ten saved titles or artists without contacting a platform."""
+        term = query.strip()
+        if not term:
+            return []
+        return list(
+            self._session.exec(
+                select(Song)
+                .where(
+                    Song.platform == platform,
+                    or_(
+                        Song.title.icontains(term, autoescape=True),
+                        Song.artist.icontains(term, autoescape=True),
+                    ),
+                )
+                .order_by(Song.title, Song.id)
+                .limit(10)
+            ).all()
+        )
 
     def update(self, song_id: UUID, update_data: dict) -> Song | None:
         """Updates an existing song with the provided data.

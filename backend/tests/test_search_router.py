@@ -11,9 +11,19 @@ from fastapi import HTTPException
 from backend.api.search.router import _persist_song, get_track_metadata, search_tracks
 from backend.core.exceptions import EntityNotFoundException
 from backend.db.models.enum import StreamingPlatforms
+from backend.repositories.session_repo import SessionRepository
 from backend.schemas.song_metadata import ReadSongMetadata
 from backend.services.music_service import MusicService
+from backend.services.room_service import RoomService
 from backend.services.song_service import SongService
+
+
+@pytest.fixture
+def search_access():
+    room_service = MagicMock(spec=RoomService)
+    session_repo = MagicMock(spec=SessionRepository)
+    session_repo.get_by_room.return_value.current_platform = StreamingPlatforms.SPOTIFY
+    return {"room_service": room_service, "session_repo": session_repo}
 
 
 class TestSearchTracks:
@@ -33,7 +43,7 @@ class TestSearchTracks:
         return user
 
     def test_search_returns_results(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
         results = [
@@ -58,6 +68,7 @@ class TestSearchTracks:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         result = anyio.run(_run)
@@ -66,7 +77,7 @@ class TestSearchTracks:
         mock_song_service.get_or_create_song.assert_called_once()
 
     def test_search_raises_404_when_room_not_found(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
 
@@ -82,6 +93,7 @@ class TestSearchTracks:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         with pytest.raises(HTTPException) as exc_info:
@@ -90,7 +102,7 @@ class TestSearchTracks:
         assert exc_info.value.status_code == 404
 
     def test_search_persists_each_result(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
         results = [
@@ -122,6 +134,7 @@ class TestSearchTracks:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         anyio.run(_run)
@@ -129,7 +142,7 @@ class TestSearchTracks:
         assert mock_song_service.get_or_create_song.call_count == 2
 
     def test_search_skips_persist_when_external_id_none(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
         results = [
@@ -154,6 +167,7 @@ class TestSearchTracks:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         anyio.run(_run)
@@ -168,7 +182,9 @@ class TestGetTrackMetadata:
 
     @pytest.fixture
     def mock_song_service(self):
-        return MagicMock(spec=SongService)
+        mock = MagicMock(spec=SongService)
+        mock.get_by_external_id.return_value = None
+        return mock
 
     @pytest.fixture
     def mock_user(self):
@@ -177,7 +193,7 @@ class TestGetTrackMetadata:
         return user
 
     def test_get_metadata_returns_track(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
         metadata = ReadSongMetadata(
@@ -200,6 +216,7 @@ class TestGetTrackMetadata:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         result = anyio.run(_run)
@@ -208,7 +225,7 @@ class TestGetTrackMetadata:
         mock_song_service.get_or_create_song.assert_called_once()
 
     def test_get_metadata_raises_404_when_room_not_found(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
 
@@ -224,6 +241,7 @@ class TestGetTrackMetadata:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         with pytest.raises(HTTPException) as exc_info:
@@ -232,7 +250,7 @@ class TestGetTrackMetadata:
         assert exc_info.value.status_code == 404
 
     def test_get_metadata_raises_404_when_track_not_found(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
 
@@ -248,6 +266,7 @@ class TestGetTrackMetadata:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         with pytest.raises(HTTPException) as exc_info:
@@ -257,7 +276,7 @@ class TestGetTrackMetadata:
         assert "nonexistent" in exc_info.value.detail
 
     def test_get_metadata_persists_result(
-        self, mock_music_service, mock_song_service, mock_user
+        self, mock_music_service, mock_song_service, mock_user, search_access
     ):
         room_id = uuid4()
         metadata = ReadSongMetadata(
@@ -280,6 +299,7 @@ class TestGetTrackMetadata:
                 current_user=mock_user,
                 music_service=mock_music_service,
                 song_service=mock_song_service,
+                **search_access,
             )
 
         anyio.run(_run)
