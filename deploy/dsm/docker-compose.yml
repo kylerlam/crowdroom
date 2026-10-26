@@ -1,7 +1,6 @@
 services:
   app:
-    image: ${CROWDROOM_IMAGE:-crowdroom:dsm-20261026}
-    platform: linux/amd64
+    image: ${CROWDROOM_IMAGE:-crowdroom:local}
     pull_policy: never
     ports:
       - "${BIND_IP:-0.0.0.0}:${HOST_PORT:-3323}:8000"
@@ -28,7 +27,6 @@ services:
 
   db:
     image: postgres:16-alpine
-    platform: linux/amd64
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-crowdroom}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
