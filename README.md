@@ -26,6 +26,10 @@ You can authorize Spotify before creating a room. Inside somebody else's room, o
 
 Spotify authorization is stored encrypted in the database, and access tokens are refreshed using the stored refresh token. Keep the database and encryption key to retain this authorization. Spotify may still require authorization again if permission is revoked or a token becomes invalid; device availability is a separate Spotify Connect state.
 
+Spotify can temporarily limit API requests. CrowdRoom shares the returned retry deadline across playback, device discovery, search, and token requests for that Spotify app, and keeps it across restarts. The room shows a countdown and disables affected controls while waiting; authorization remains connected. Existing music can continue playing, but playback updates cannot be refreshed until Spotify permits requests again.
+
+CrowdRoom follows playback, pause, track changes, and seeks made on the host's selected Spotify device. Observing a phone track change preserves waiting songs. After a restart, monitoring resumes without issuing a Play command; paused and idle sessions poll less often.
+
 ### Registered member
 
 1. Log in and open the room link, enter the room code, or scan its QR code.
@@ -91,6 +95,23 @@ COOKIE_SECURE=False
 
 Set `SPOTIFY_CLIENT_ID` and `SPOTIFY_CLIENT_SECRET` from your Spotify app, and register the exact `SPOTIFY_REDIRECT_URI` in its developer dashboard. When changing the host port, update both URLs and the registered callback. Spotify requires HTTPS except for explicit loopback IP addresses; `localhost` is not accepted as a redirect URI. See [Spotify's redirect URI requirements](https://developer.spotify.com/documentation/web-api/concepts/redirect_uri).
 
+### Let phones join on the same Wi-Fi
+
+A phone cannot reach the computer through `127.0.0.1`: that address points back to the phone. For a local Docker installation, expose the app to the LAN and set a separate public origin for QR and copied invite links:
+
+```env
+BIND_IP=0.0.0.0
+HOST_PORT=8000
+PUBLIC_URL=http://192.168.1.20:8000
+FRONTEND_URL=http://127.0.0.1:8000
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8000/api/v1/auth/spotify/callback
+COOKIE_SECURE=False
+```
+
+Replace the example IP with the computer's current LAN address and keep the port consistent. Recreate the app container after changing `.env`, then generate a new QR code. Check the public URL from the phone first; the computer firewall or Wi-Fi client isolation can still block LAN access. Reserve the computer's LAN address in DHCP or update `PUBLIC_URL` if that address changes.
+
+The host should keep opening CrowdRoom through `FRONTEND_URL` when authorizing Spotify, so the authorization and callback use the same browser host and cookies. Guests use `PUBLIC_URL`; their sessions on the LAN address are separate from sessions on the loopback address. `PUBLIC_URL` must be an HTTP(S) origin without a path, credentials, query, or fragment. If empty, shared links use `FRONTEND_URL` as before. It does not change the Spotify callback or bypass room access rules.
+
 ### First start with an empty database
 
 Run migrations before starting the app, so Alembic records the schema from the beginning:
@@ -136,6 +157,7 @@ Expose CrowdRoom through an HTTPS reverse proxy and change these `.env` values:
 BIND_IP=0.0.0.0
 HOST_PORT=8000
 FRONTEND_URL=https://music.example.com
+PUBLIC_URL=https://music.example.com
 SPOTIFY_REDIRECT_URI=https://music.example.com/api/v1/auth/spotify/callback
 COOKIE_SECURE=True
 # Replace with the actual trusted proxy peer address seen by the app container.
@@ -166,6 +188,7 @@ Compose passes the root `.env` into the app container. Native backend settings l
 | `DATABASE_URL` | Database DSN; the bundled Compose service hostname is `db` |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | Initial bundled PostgreSQL credentials; match the DSN |
 | `FRONTEND_URL` | Browser-facing frontend origin for CORS and redirects |
+| `PUBLIC_URL` | Optional QR and copied-invite origin; defaults to `FRONTEND_URL` and does not change OAuth redirects |
 | `SPOTIFY_CLIENT_ID`, `SPOTIFY_CLIENT_SECRET` | Spotify developer app credentials |
 | `SPOTIFY_REDIRECT_URI` | Exact registered callback URL |
 | `COOKIE_SECURE` | `True` for browser-facing HTTPS, `False` for local HTTP |
