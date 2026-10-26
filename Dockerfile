@@ -49,6 +49,7 @@ FROM python-base AS runtime
 WORKDIR /app
 
 COPY backend/ ./backend/
+COPY scripts/ ./scripts/
 COPY alembic.ini ./
 COPY --from=frontend-builder /build/dist ./frontend/dist
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh

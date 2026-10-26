@@ -21,7 +21,7 @@ from backend.core.exceptions import (
     SpotifyRateLimitedException,
     SpotifyUpstreamException,
 )
-from backend.core.spotify_rate_limit import assert_ready
+from backend.core.spotify_rate_limit import assert_ready, spotify_request_source
 from backend.db.database import engine
 from backend.db.models.enum import ConnectionType, ItemStatus, StreamingPlatforms
 from backend.db.models.platform_connection import PlatformConnection
@@ -674,6 +674,7 @@ class PlaybackPollerService:
             return interval * 2
         return interval
 
+    @spotify_request_source("poll")
     async def _poll_loop(self, room_id: UUID, host_user_id: UUID) -> None:
         """Poll Spotify playback state and reconcile with internal queue.
 

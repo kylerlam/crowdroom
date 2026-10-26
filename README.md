@@ -232,6 +232,20 @@ For frontend tests and the production build:
 docker run --rm -v "$PWD/frontend:/work" -w /work node:22-bookworm-slim sh -c 'corepack enable && corepack prepare pnpm@9 --activate && pnpm install --frozen-lockfile && pnpm test && pnpm build'
 ```
 
+### Diagnose Spotify request volume
+
+Completed Spotify HTTP requests are logged as `spotify_request` JSON events. Each event records the task source, normalized endpoint, HTTP status, duration, hashed app scope, and any supported 429 reason and retry deadline. Tokens, search text, user identifiers, track IDs, and response bodies are excluded. Calls blocked by the existing local cooldown do not count as outbound requests.
+
+Summarize the captured container logs without contacting Spotify:
+
+```bash
+docker logs --timestamps crowdroom-app 2>&1 | docker exec -i crowdroom-app python scripts/spotify_usage_report.py
+```
+
+The report separates Accounts token requests from Web API requests and shows per-source, per-endpoint counts and the peak rolling 30-second Web API request count. `poll` includes all requests caused by a background task, including automatic track changes; use its endpoint breakdown to isolate state queries. Counts aggregate the captured sample across app scopes and are not Spotify's unpublished quota threshold. Docker container recreation removes its old logs, so export the report and logs before redeploying when investigating an incident.
+
+A `QUOTA_EXCEEDED` reason identifies the developer quota response. An unspecified reason cannot prove which Spotify limit was reached. These diagnostics begin at deployment and cannot reconstruct requests or error bodies that were never recorded. Measure search traffic, background state reads, and playback commands separately before changing song-request quotas.
+
 ## Project layout
 
 ```text

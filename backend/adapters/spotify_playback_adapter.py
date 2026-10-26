@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import httpx
 
 from backend.core.exceptions import SpotifyUpstreamException
-from backend.core.spotify_rate_limit import spotify_request
+from backend.core.spotify_rate_limit import spotify_request, spotify_request_source
 
 
 @dataclass
@@ -139,6 +139,7 @@ class SpotifyPlaybackAdapter:
         # command's resulting playback state can prove it started successfully.
         return device_id
 
+    @spotify_request_source("confirm")
     async def _confirm_playback(self, device_id: str, track_uri: str | None) -> None:
         """Require real playback on the requested device after Spotify accepts Play."""
         track_id = track_uri.rsplit(":", 1)[-1] if track_uri else None

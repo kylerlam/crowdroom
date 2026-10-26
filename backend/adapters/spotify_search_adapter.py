@@ -8,7 +8,7 @@ import httpx
 from backend.adapters.base import BaseAdapter
 from backend.adapters.cache import get_cached_metadata, set_cached_metadata
 from backend.adapters.spotify_utils import request_token
-from backend.core.spotify_rate_limit import spotify_request
+from backend.core.spotify_rate_limit import spotify_request, spotify_request_source
 from backend.db.models.enum import StreamingPlatforms
 from backend.schemas.song_metadata import ReadSongMetadata
 
@@ -52,6 +52,7 @@ class SpotifySearchAdapter(BaseAdapter):
         self._token_expiry = time.time() + data["expires_in"] - 60
         return self._token
 
+    @spotify_request_source("search")
     async def search(self, query: str | None = None) -> list[ReadSongMetadata]:
         """Search Spotify for tracks matching the query.
 
@@ -81,6 +82,7 @@ class SpotifySearchAdapter(BaseAdapter):
         tracks = response.json().get("tracks", {}).get("items", [])
         return [self._map_track(track) for track in tracks]
 
+    @spotify_request_source("metadata")
     async def get_metadata(self, external_id: str) -> ReadSongMetadata | None:
         """Fetch full track metadata from Spotify by track ID.
 
