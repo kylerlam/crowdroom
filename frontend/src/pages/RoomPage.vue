@@ -46,7 +46,7 @@
       <section class="panel now-playing-panel">
         <div v-if="spotifyRateLimited" class="spotify-cooldown" role="note" aria-label="Spotify request cooldown">
           <p>Spotify's request limit has been reached. Try again in {{ spotifyWaitLabel }}.</p>
-          <p class="text-secondary">Music already playing can continue. CrowdRoom controls, search and playback updates are temporarily unavailable.</p>
+          <p class="text-secondary">Music already playing can continue. Playback controls and updates are temporarily unavailable. Saved songs can still be searched and added to the queue.</p>
         </div>
         <div v-if="!currentSong" class="empty-state">
           <i class="ph ph-play"></i>
@@ -204,14 +204,14 @@
               class="input"
               placeholder="Search for songs..."
               autocomplete="off"
-              :disabled="!!spotifyBanner || spotifyRateLimited"
+              :disabled="!!spotifyBanner"
               @input="debouncedSearch"
             />
           </div>
           <p v-if="isGuest" class="guest-request-notice text-secondary">
             {{ guestRequestMessage }}
           </p>
-          <p v-if="spotifyRateLimited" class="text-secondary">Spotify search is temporarily unavailable. Try again in {{ spotifyWaitLabel }}.</p>
+          <p v-if="spotifyRateLimited" class="text-secondary">Searching saved songs while Spotify is unavailable. Live search can resume in {{ spotifyWaitLabel }}.<span v-if="!isGuest"> Registered accounts have no guest request limits.</span></p>
           <div class="track-list">
             <TrackItem v-for="track in searchResults" :key="track.external_id" :track="track">
               <template #actions>
@@ -219,7 +219,7 @@
                   class="btn btn-secondary"
                   :title="isGuest && guestRequestBlocked ? guestRequestMessage : 'Add to queue'"
                   :aria-label="`Add ${track.title} to queue`"
-                  :disabled="spotifyRateLimited || addingIds.has(track.external_id) || (isGuest && (guestRequestBlocked || addingIds.size > 0))"
+                  :disabled="addingIds.has(track.external_id) || (isGuest && (guestRequestBlocked || addingIds.size > 0))"
                   @click="addToQueue(track.external_id)"
                 >
                   <i class="ph ph-plus"></i>
@@ -1121,7 +1121,6 @@ function debouncedSearch() {
 }
 
 async function handleSearch(query) {
-  if (spotifyRateLimited.value) return;
   // Cancel any in-flight search so out-of-order responses can't overwrite
   // results from a newer query.
   if (searchController) searchController.abort();
@@ -1144,7 +1143,6 @@ async function handleSearch(query) {
 }
 
 async function addToQueue(externalId) {
-  if (spotifyRateLimited.value) return;
   if (!sessionId.value) {
     showToast('No active session');
     return;
@@ -1153,8 +1151,14 @@ async function addToQueue(externalId) {
   if (isGuest?.value && (guestRequestBlocked.value || addingIds.value.size > 0)) return;
   addingIds.value = new Set(addingIds.value).add(externalId);
   try {
-    await apiGet(`/search/${externalId}?room_id=${roomId.value}`);
-    const dbSong = await apiGet(`/songs/by-external/${externalId}?platform=spotify`);
+    let dbSong;
+    try {
+      dbSong = await apiGet(`/songs/by-external/${externalId}?platform=spotify`);
+    } catch (err) {
+      if (err.status !== 404) throw err;
+      await apiGet(`/search/${externalId}?room_id=${roomId.value}`);
+      dbSong = await apiGet(`/songs/by-external/${externalId}?platform=spotify`);
+    }
     await apiPost('/queue/', { session_id: sessionId.value, song_id: dbSong.id, group: 'manual' });
     showToast('Added to queue', 'success');
     await loadQueue();

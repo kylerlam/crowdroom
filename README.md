@@ -28,6 +28,8 @@ Spotify authorization is stored encrypted in the database, and access tokens are
 
 Spotify can temporarily limit API requests. CrowdRoom shares the returned retry deadline across playback, device discovery, search, and token requests for that Spotify app, and keeps it across restarts. The room shows a countdown and disables affected controls while waiting; authorization remains connected. Existing music can continue playing, but playback updates cannot be refreshed until Spotify permits requests again.
 
+During that cooldown, saved songs remain searchable and can still be added to the local queue without a Spotify request. Registered hosts, administrators, and members have no guest request quota. Guests retain their five-minute first-entry wait, thirty-minute request interval, and one-waiting-song limit. Online results and playback commands still wait for Spotify.
+
 CrowdRoom follows playback, pause, track changes, and seeks made on the host's selected Spotify device. Observing a phone track change preserves waiting songs. After a restart, monitoring resumes without issuing a Play command; paused and idle sessions poll less often.
 
 ### Registered member

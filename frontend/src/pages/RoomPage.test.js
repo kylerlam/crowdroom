@@ -188,7 +188,8 @@ describe('guest song requests', () => {
     });
   });
 
-  it('shows the first-entry countdown and enables a request only when five minutes have elapsed', async () => {
+  it.each([false, true])('shows the guest first-entry wait independently of Spotify cooldown (%s)', async (cooldown) => {
+    if (cooldown) rateLimitUntil = new Date(Date.now() + 600000).toISOString();
     await renderGuest();
     expect(wrapper.get('.guest-request-notice').text()).toContain('5:00');
     expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
@@ -198,7 +199,8 @@ describe('guest song requests', () => {
     expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeUndefined();
   });
 
-  it('refreshes the persisted quota after a successful request and shows the thirty-minute wait', async () => {
+  it.each([false, true])('keeps the guest thirty-minute wait after a saved request during Spotify cooldown (%s)', async (cooldown) => {
+    if (cooldown) rateLimitUntil = new Date(Date.now() + 3600000).toISOString();
     await renderGuest(-1);
     mocks.apiPost.mockImplementation(async () => {
       mocks.guestRequestAvailableAt.value = new Date(Date.now() + 1800000).toISOString();
@@ -579,7 +581,7 @@ describe('Spotify shared request cooldown', () => {
     expect(wrapper.get('.spotify-cooldown').text()).toContain('2:00');
     expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
     expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
     expect(wrapper.get('.spotify-device-controls button').attributes('disabled')).toBeDefined();
     expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/devices');
     const requestCount = mocks.apiGet.mock.calls.length;
@@ -630,7 +632,7 @@ describe('Spotify shared request cooldown', () => {
     mocks.handlers.get('spotify_rate_limited')({ retry_at: new Date(Date.now() + 90000).toISOString(), retry_after: 90 });
     await flushPromises();
     expect(wrapper.get('.spotify-cooldown').text()).toContain('1:30');
-    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
     expect(mocks.apiGet).toHaveBeenCalledTimes(requests);
   });
 
@@ -650,5 +652,79 @@ describe('Spotify shared request cooldown', () => {
     expect(wrapper.get('.spotify-cooldown').text()).toContain('2:00');
     expect(wrapper.get('.guest-request-notice').text()).toContain('You can request a song now');
     expect(mocks.apiPost).not.toHaveBeenCalled();
+  });
+
+  it.each(['owner', 'admin', 'member', 'test'])('lets registered %s search and queue multiple saved songs during Spotify cooldown', async (actor) => {
+    mocks.userId.value = actor;
+    rateLimitUntil = new Date(Date.now() + 60000).toISOString();
+    pending = [1, 2].map((id) => ({ id: `waiting-${id}`, song: { title: 'Waiting' }, added_by: { id: actor } }));
+    const defaultGet = mocks.apiGet.getMockImplementation();
+    mocks.apiGet.mockImplementation(async (path) => {
+      if (path.startsWith('/search/?')) return [{ external_id: 'saved', title: 'Saved song', artist: 'Artist' }];
+      if (path === '/songs/by-external/saved?platform=spotify') return { id: 'saved-song' };
+      return defaultGet(path);
+    });
+    mocks.apiPost.mockResolvedValue({});
+    await renderRoom();
+    expect(wrapper.find('.guest-request-notice').exists()).toBe(false);
+    expect(wrapper.text()).toContain('Registered accounts have no guest request limits.');
+    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
+    await wrapper.get('[placeholder="Search for songs..."]').setValue('Saved');
+    await vi.advanceTimersByTimeAsync(300);
+    await flushPromises();
+    const add = wrapper.get('[aria-label="Add Saved song to queue"]');
+    expect(add.attributes('disabled')).toBeUndefined();
+    await add.trigger('click');
+    await flushPromises();
+    await add.trigger('click');
+    await flushPromises();
+    expect(mocks.apiPost).toHaveBeenCalledTimes(2);
+    expect(mocks.apiPost).toHaveBeenLastCalledWith('/queue/', { session_id: 'session', song_id: 'saved-song', group: 'manual' });
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/search/saved?room_id=room');
+    expect(mocks.fetchMe).not.toHaveBeenCalled();
+    expect(wrapper.find('.spotify-cooldown').exists()).toBe(true);
+    if (['owner', 'admin'].includes(actor)) expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
+  });
+
+  it('fetches metadata only when a queued track is absent from the local catalog', async () => {
+    const defaultGet = mocks.apiGet.getMockImplementation();
+    let stored = false;
+    mocks.apiGet.mockImplementation(async (path) => {
+      if (path.startsWith('/search/?')) return [{ external_id: 'new', title: 'New song', artist: 'Artist' }];
+      if (path === '/songs/by-external/new?platform=spotify') {
+        if (!stored) throw { status: 404 };
+        return { id: 'new-song' };
+      }
+      if (path === '/search/new?room_id=room') { stored = true; return {}; }
+      return defaultGet(path);
+    });
+    mocks.apiPost.mockResolvedValue({});
+    await renderRoom();
+    await wrapper.get('[placeholder="Search for songs..."]').setValue('New');
+    await vi.advanceTimersByTimeAsync(300);
+    await flushPromises();
+    await wrapper.get('[aria-label="Add New song to queue"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiGet).toHaveBeenCalledWith('/search/new?room_id=room');
+    expect(mocks.apiGet.mock.calls.filter(([path]) => path === '/songs/by-external/new?platform=spotify')).toHaveLength(2);
+    expect(mocks.apiPost).toHaveBeenCalledWith('/queue/', { session_id: 'session', song_id: 'new-song', group: 'manual' });
+  });
+
+  it('does not treat a local catalog failure as a missing track', async () => {
+    const defaultGet = mocks.apiGet.getMockImplementation();
+    mocks.apiGet.mockImplementation(async (path) => {
+      if (path.startsWith('/search/?')) return [{ external_id: 'saved', title: 'Saved song', artist: 'Artist' }];
+      if (path === '/songs/by-external/saved?platform=spotify') throw { status: 503, detail: 'Catalog unavailable' };
+      return defaultGet(path);
+    });
+    await renderRoom();
+    await wrapper.get('[placeholder="Search for songs..."]').setValue('Saved');
+    await vi.advanceTimersByTimeAsync(300);
+    await flushPromises();
+    await wrapper.get('[aria-label="Add Saved song to queue"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/search/saved?room_id=room');
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+    expect(mocks.showToast).toHaveBeenCalledWith('Catalog unavailable');
   });
 });
