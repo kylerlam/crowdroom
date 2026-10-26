@@ -188,7 +188,27 @@
       <section class="panel search-panel">
         <details @toggle="onSearchToggle">
           <summary>
-            <h3><i class="ph ph-magnifying-glass"></i> Search</h3>
+            <h3>
+              <i class="ph ph-magnifying-glass"></i> Search
+              <button
+                v-if="isGuest"
+                type="button"
+                class="guest-rules-info"
+                aria-label="Guest request rules"
+                :aria-describedby="guestRulesVisible ? 'guest-request-rules' : undefined"
+                :aria-expanded="guestRulesVisible"
+                @mouseenter="guestRulesVisible = true"
+                @mouseleave="onGuestRulesLeave"
+                @focus="guestRulesVisible = true"
+                @blur="guestRulesVisible = false"
+                @click.stop.prevent="guestRulesVisible = true"
+                @keydown.esc.stop.prevent="guestRulesVisible = false"
+              >
+                <i class="ph ph-info" aria-hidden="true"></i>
+                <span v-if="guestRulesVisible" id="guest-request-rules" class="guest-rules-tooltip" role="tooltip">{{ guestRequestRules }}</span>
+              </button>
+              <span v-if="isGuest" class="guest-request-notice" role="timer" aria-live="off" :aria-label="guestRequestStatus">{{ guestRequestStatus }}</span>
+            </h3>
           </summary>
           <div v-if="spotifyBanner" class="empty-state">
             <i class="ph ph-spotify-logo"></i>
@@ -208,9 +228,6 @@
               @input="debouncedSearch"
             />
           </div>
-          <p v-if="isGuest" class="guest-request-notice text-secondary">
-            {{ guestRequestMessage }}
-          </p>
           <p v-if="spotifyRateLimited" class="text-secondary">Searching saved songs while Spotify is unavailable. Live search can resume in {{ spotifyWaitLabel }}.<span v-if="!isGuest"> Registered accounts have no guest request limits.</span></p>
           <div class="track-list">
             <TrackItem v-for="track in searchResults" :key="track.external_id" :track="track">
@@ -551,16 +568,29 @@ const guestWaitSeconds = computed(() => {
   return Math.max(0, Math.ceil((Math.max(serverDeadline, guestRetryUntil.value) - quotaNow.value) / 1000));
 });
 const guestRequestBlocked = computed(() => !guestRequestAvailableAt?.value || guestPending.value || guestWaitSeconds.value > 0);
-const guestRequestMessage = computed(() => {
-  const rules = 'Guests wait 5 minutes after first joining, then may request one song every 30 minutes. One queued song at a time.';
-  if (guestPending.value) return `Your song is already in the queue. ${rules}`;
+const guestRulesVisible = ref(false);
+const guestRequestRules = 'Guests wait 5 minutes after first joining, then may request one song every 30 minutes. One queued song at a time.';
+function onGuestRulesLeave(event) {
+  if (document.activeElement !== event.currentTarget) guestRulesVisible.value = false;
+}
+const guestWaitLabel = computed(() => {
+  const minutes = String(Math.floor(guestWaitSeconds.value / 60)).padStart(2, '0');
+  const seconds = String(guestWaitSeconds.value % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
+});
+const guestRequestStatus = computed(() => {
   if (guestWaitSeconds.value > 0) {
-    const minutes = Math.floor(guestWaitSeconds.value / 60);
-    const seconds = String(guestWaitSeconds.value % 60).padStart(2, '0');
-    return `You can request your next song in ${minutes}:${seconds}. ${rules}`;
+    return `${guestPending.value ? 'Song queued ·' : 'Next request in'} ${guestWaitLabel.value}`;
   }
-  if (!guestRequestAvailableAt?.value) return `Checking your request allowance… ${rules}`;
-  return `You can request a song now. ${rules}`;
+  if (guestPending.value) return 'Song queued';
+  if (!guestRequestAvailableAt?.value) return 'Checking…';
+  return 'Ready to request';
+});
+const guestRequestMessage = computed(() => {
+  if (guestPending.value) return 'Your song is already in the queue.';
+  if (guestWaitSeconds.value > 0) return `You can request your next song in ${guestWaitLabel.value}.`;
+  if (!guestRequestAvailableAt?.value) return 'Checking your request allowance…';
+  return 'You can request a song now.';
 });
 const members = ref([]);
 const bannedUsers = ref([]);

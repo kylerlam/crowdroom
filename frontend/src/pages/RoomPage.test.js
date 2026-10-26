@@ -195,7 +195,7 @@ describe('guest song requests', () => {
     expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
     expect(mocks.fetchMe).toHaveBeenCalledOnce();
     await vi.advanceTimersByTimeAsync(300000);
-    expect(wrapper.get('.guest-request-notice').text()).toContain('You can request a song now');
+    expect(wrapper.get('.guest-request-notice').text()).toBe('Ready to request');
     expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeUndefined();
   });
 
@@ -217,7 +217,7 @@ describe('guest song requests', () => {
   it('keeps a second request blocked while the guest already has one pending song', async () => {
     pending = [{ id: 'pending', song: { title: 'Waiting' }, added_by: { id: 'guest', username: 'Guest' } }];
     await renderGuest(-1);
-    expect(wrapper.get('.guest-request-notice').text()).toContain('Your song is already in the queue');
+    expect(wrapper.get('.guest-request-notice').text()).toBe('Song queued');
     expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
     mocks.handlers.get('queue_updated')({ queue: [] });
     await flushPromises();
@@ -238,6 +238,65 @@ describe('guest song requests', () => {
     mocks.serverClockOffset.value = 3600000;
     await renderGuest(3900);
     expect(wrapper.get('.guest-request-notice').text()).toContain('5:00');
+  });
+
+  it('shows a zero-padded countdown beside Search and ticks without making requests', async () => {
+    await renderGuest();
+    const timer = wrapper.get('.search-panel summary [role="timer"]');
+    expect(timer.text()).toBe('Next request in 05:00');
+    expect(timer.attributes('aria-live')).toBe('off');
+    const requests = mocks.apiGet.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(timer.text()).toBe('Next request in 04:59');
+    expect(mocks.apiGet).toHaveBeenCalledTimes(requests);
+    expect(wrapper.text()).not.toContain('Guests wait 5 minutes');
+  });
+
+  it('keeps the cooldown visible for a queued song and stays blocked at zero', async () => {
+    pending = [{ id: 'pending', song: { title: 'Waiting' }, added_by: { id: 'guest' } }];
+    await renderGuest(2);
+    expect(wrapper.get('[role="timer"]').text()).toBe('Song queued · 00:02');
+    expect(wrapper.get('[role="timer"]').attributes('aria-label')).toBe('Song queued · 00:02');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(wrapper.get('[role="timer"]').text()).toBe('Song queued · 00:01');
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(wrapper.get('[role="timer"]').text()).toBe('Song queued');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeDefined();
+    mocks.handlers.get('queue_updated')({ queue: [] });
+    await flushPromises();
+    expect(wrapper.get('[role="timer"]').text()).toBe('Ready to request');
+    expect(wrapper.get('[aria-label="Add Honey to queue"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('keeps an unknown allowance blocked while checking', async () => {
+    mocks.isGuest.value = true;
+    mocks.userId.value = 'guest';
+    await renderRoom();
+    expect(wrapper.get('[role="timer"]').text()).toBe('Checking…');
+    expect(wrapper.get('[role="timer"]').attributes('aria-label')).toBe('Checking…');
+    expect(wrapper.get('[aria-label="Guest request rules"]').exists()).toBe(true);
+  });
+
+  it('reveals rules on hover, focus and tap without toggling Search', async () => {
+    await renderGuest();
+    const details = wrapper.get('.search-panel details');
+    details.element.open = true;
+    const info = wrapper.get('[aria-label="Guest request rules"]');
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
+    await info.trigger('mouseenter');
+    expect(wrapper.get('[role="tooltip"]').text()).toBe('Guests wait 5 minutes after first joining, then may request one song every 30 minutes. One queued song at a time.');
+    expect(info.attributes('aria-describedby')).toBe(wrapper.get('[role="tooltip"]').attributes('id'));
+    await info.trigger('mouseleave');
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
+    await info.trigger('focus');
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(true);
+    await info.trigger('keydown', { key: 'Escape' });
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
+    await info.trigger('click');
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(true);
+    expect(details.element.open).toBe(true);
+    await info.trigger('blur');
+    expect(wrapper.find('[role="tooltip"]').exists()).toBe(false);
   });
 });
 
@@ -650,7 +709,7 @@ describe('Spotify shared request cooldown', () => {
     await vi.advanceTimersByTimeAsync(300);
     await flushPromises();
     expect(wrapper.get('.spotify-cooldown').text()).toContain('2:00');
-    expect(wrapper.get('.guest-request-notice').text()).toContain('You can request a song now');
+    expect(wrapper.get('.guest-request-notice').text()).toBe('Ready to request');
     expect(mocks.apiPost).not.toHaveBeenCalled();
   });
 
@@ -667,6 +726,7 @@ describe('Spotify shared request cooldown', () => {
     mocks.apiPost.mockResolvedValue({});
     await renderRoom();
     expect(wrapper.find('.guest-request-notice').exists()).toBe(false);
+    expect(wrapper.find('[aria-label="Guest request rules"]').exists()).toBe(false);
     expect(wrapper.text()).toContain('Registered accounts have no guest request limits.');
     expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeUndefined();
     await wrapper.get('[placeholder="Search for songs..."]').setValue('Saved');
