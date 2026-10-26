@@ -143,6 +143,18 @@
   color: var(--accent);
 }
 
+.spotify-cooldown {
+  padding: var(--space-3);
+  margin-bottom: var(--space-4);
+  border: 1px solid var(--border-primary);
+  border-radius: var(--radius-sm);
+}
+
+.spotify-cooldown p + p {
+  margin-top: var(--space-2);
+  font-size: var(--font-size-sm);
+}
+
 .spotify-device-panel {
   margin-top: var(--space-4);
 }

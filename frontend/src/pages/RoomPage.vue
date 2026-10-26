@@ -44,12 +44,16 @@
     <main class="room-layout">
       <!-- Now Playing -->
       <section class="panel now-playing-panel">
+        <div v-if="spotifyRateLimited" class="spotify-cooldown" role="note" aria-label="Spotify request cooldown">
+          <p>Spotify's request limit has been reached. Try again in {{ spotifyWaitLabel }}.</p>
+          <p class="text-secondary">Music already playing can continue. CrowdRoom controls, search and playback updates are temporarily unavailable.</p>
+        </div>
         <div v-if="!currentSong" class="empty-state">
           <i class="ph ph-play"></i>
           <button
             v-if="isManager"
             class="btn btn-primary"
-            :disabled="resuming"
+            :disabled="resuming || spotifyRateLimited"
             title="Resume playback"
             @click="resumePlayback"
           >Resume</button>
@@ -90,10 +94,10 @@
             </button>
           </div>
           <div v-if="isManager" class="playback-controls">
-            <button class="btn btn-icon" title="Play/Pause" :disabled="spotifyPlaybackRequired" @click="togglePlayPause">
+            <button class="btn btn-icon" title="Play/Pause" :disabled="spotifyPlaybackRequired || spotifyRateLimited" @click="togglePlayPause">
               <i :class="isPlaying ? 'ph ph-pause' : 'ph ph-play'"></i>
             </button>
-            <button class="btn btn-icon" title="Skip" :disabled="spotifyPlaybackRequired" @click="hostSkip">
+            <button class="btn btn-icon" title="Skip" :disabled="spotifyPlaybackRequired || spotifyRateLimited" @click="hostSkip">
               <i class="ph ph-skip-forward"></i>
             </button>
           </div>
@@ -106,7 +110,7 @@
               id="spotify-device"
               v-model="selectedDeviceId"
               class="input"
-              :disabled="devicesLoading || deviceSelecting || !availableDevices.length"
+              :disabled="spotifyRateLimited || devicesLoading || deviceSelecting || !availableDevices.length"
               @change="selectSpotifyDevice"
             >
               <option value="" disabled>Select a device</option>
@@ -114,12 +118,12 @@
                 {{ device.name }}{{ device.is_active ? ' (active)' : '' }}
               </option>
             </select>
-            <button class="btn btn-secondary" :disabled="devicesLoading || deviceSelecting" @click="loadSpotifyDevices">
+            <button class="btn btn-secondary" :disabled="spotifyRateLimited || devicesLoading || deviceSelecting" @click="loadSpotifyDevices">
               <i class="ph ph-arrow-clockwise" aria-hidden="true"></i> Refresh devices
             </button>
           </div>
           <p v-if="deviceError" class="error-text" role="status">{{ deviceError }}</p>
-          <p v-else-if="!devicesLoading && !availableDevices.length" class="text-tertiary spotify-device-help" role="status">
+          <p v-else-if="!spotifyRateLimited && !devicesLoading && !availableDevices.length" class="text-tertiary spotify-device-help" role="status">
             No Spotify devices are available. Keep Spotify open, then refresh devices.
           </p>
           <a href="https://open.spotify.com/" target="_blank" rel="noopener" class="spotify-device-link">Open Spotify</a>
@@ -200,13 +204,14 @@
               class="input"
               placeholder="Search for songs..."
               autocomplete="off"
-              :disabled="!!spotifyBanner"
+              :disabled="!!spotifyBanner || spotifyRateLimited"
               @input="debouncedSearch"
             />
           </div>
           <p v-if="isGuest" class="guest-request-notice text-secondary">
             {{ guestRequestMessage }}
           </p>
+          <p v-if="spotifyRateLimited" class="text-secondary">Spotify search is temporarily unavailable. Try again in {{ spotifyWaitLabel }}.</p>
           <div class="track-list">
             <TrackItem v-for="track in searchResults" :key="track.external_id" :track="track">
               <template #actions>
@@ -214,7 +219,7 @@
                   class="btn btn-secondary"
                   :title="isGuest && guestRequestBlocked ? guestRequestMessage : 'Add to queue'"
                   :aria-label="`Add ${track.title} to queue`"
-                  :disabled="addingIds.has(track.external_id) || (isGuest && (guestRequestBlocked || addingIds.size > 0))"
+                  :disabled="spotifyRateLimited || addingIds.has(track.external_id) || (isGuest && (guestRequestBlocked || addingIds.size > 0))"
                   @click="addToQueue(track.external_id)"
                 >
                   <i class="ph ph-plus"></i>
@@ -529,6 +534,16 @@ const pinnedCount = computed(() => queueItems.value.filter((item) => item.is_pin
 const quotaNow = ref(Date.now());
 const guestRetryUntil = ref(0);
 let guestQuotaTimer = null;
+const spotifyRetryUntil = ref(0);
+const spotifyWaitSeconds = computed(() => Math.max(0, Math.ceil((spotifyRetryUntil.value - quotaNow.value) / 1000)));
+const spotifyRateLimited = computed(() => spotifyWaitSeconds.value > 0);
+const spotifyWaitLabel = computed(() => {
+  const total = spotifyWaitSeconds.value;
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = String(total % 60).padStart(2, '0');
+  return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`;
+});
 const guestPending = computed(() => queueItems.value.some((item) => item.added_by?.id === userId.value));
 const guestWaitSeconds = computed(() => {
   const availableAt = Date.parse(guestRequestAvailableAt?.value);
@@ -623,10 +638,10 @@ onMounted(async () => {
   }
 
   try {
+    guestQuotaTimer = setInterval(() => { quotaNow.value = Date.now(); }, 1000);
     if (isGuest?.value) {
       await fetchMe();
       quotaNow.value = Date.now();
-      guestQuotaTimer = setInterval(() => { quotaNow.value = Date.now(); }, 1000);
     }
     await loadRoom();
     await loadSession();
@@ -715,11 +730,37 @@ function closeQRModal() {
 
 async function copyJoinLink() {
   if (!qrInvite.value) return;
+  const url = qrInvite.value.url;
   try {
-    await navigator.clipboard.writeText(qrInvite.value.url);
+    let copied = false;
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(url);
+        copied = true;
+      } catch {
+        // A LAN HTTP page may only support a user-initiated selection copy.
+      }
+    }
+    if (!copied) {
+      const previousFocus = document.activeElement;
+      const input = document.createElement('textarea');
+      input.value = url;
+      input.setAttribute('readonly', '');
+      input.setAttribute('aria-hidden', 'true');
+      input.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;';
+      document.body.appendChild(input);
+      try {
+        input.select();
+        copied = document.execCommand?.('copy') === true;
+      } finally {
+        input.remove();
+        previousFocus?.focus({ preventScroll: true });
+      }
+    }
+    if (!copied) throw new Error('Copy unavailable');
     showToast('Link copied');
   } catch {
-    showToast('Could not copy link');
+    showToast('Could not copy link. Select the link and copy it manually.');
   }
 }
 
@@ -961,6 +1002,7 @@ let currentExternalId = null;
 
 async function syncPlaybackPosition() {
   const state = await apiGet(`/rooms/${roomId.value}/playback`);
+  applySpotifyCooldown(state.rate_limit_until, state.retry_after);
   if (state.status === 'playing') {
     isPlaying.value = true;
     playbackPositionMs.value = state.elapsed_ms || 0;
@@ -1007,7 +1049,8 @@ function startProgressAnimation() {
 async function checkSpotifyConnection() {
   if (!isManager.value) return;
   try {
-    const { authorized } = await apiGet('/playback/spotify/status');
+    const { authorized, rate_limit_until, retry_after } = await apiGet('/playback/spotify/status');
+    applySpotifyCooldown(rate_limit_until, retry_after);
     spotifyPlaybackRequired.value = !authorized;
     spotifyConnectionKnown.value = true;
     if (isHost.value) {
@@ -1032,7 +1075,7 @@ function onDevicesToggle(event) {
 }
 
 async function loadSpotifyDevices() {
-  if (!isHost.value || spotifyPlaybackRequired.value || devicesLoading.value) return;
+  if (!isHost.value || spotifyPlaybackRequired.value || spotifyRateLimited.value || devicesLoading.value) return;
   devicesLoading.value = true;
   deviceError.value = '';
   try {
@@ -1040,7 +1083,9 @@ async function loadSpotifyDevices() {
     spotifyDevices.value = devices;
     selectedDeviceId.value = selected_device_id || devices.find((device) => device.is_active && !device.is_restricted)?.id || '';
   } catch (err) {
-    if (err.code === 'SPOTIFY_AUTH_REQUIRED') {
+    if (recordSpotifyRateLimit(err)) {
+      deviceError.value = '';
+    } else if (err.code === 'SPOTIFY_AUTH_REQUIRED') {
       spotifyPlaybackRequired.value = true;
       spotifyConnectionKnown.value = true;
     } else {
@@ -1052,7 +1097,7 @@ async function loadSpotifyDevices() {
 }
 
 async function selectSpotifyDevice() {
-  if (!isHost.value || !selectedDeviceId.value || deviceSelecting.value) return;
+  if (!isHost.value || spotifyRateLimited.value || !selectedDeviceId.value || deviceSelecting.value) return;
   deviceSelecting.value = true;
   try {
     await apiPut('/playback/device', { device_id: selectedDeviceId.value });
@@ -1076,6 +1121,7 @@ function debouncedSearch() {
 }
 
 async function handleSearch(query) {
+  if (spotifyRateLimited.value) return;
   // Cancel any in-flight search so out-of-order responses can't overwrite
   // results from a newer query.
   if (searchController) searchController.abort();
@@ -1090,6 +1136,7 @@ async function handleSearch(query) {
     );
   } catch (err) {
     if (err.name === 'AbortError') return;
+    if (recordSpotifyRateLimit(err)) return;
     showToast(err.detail || 'Search failed');
   } finally {
     if (!signal.aborted) searching.value = false;
@@ -1097,6 +1144,7 @@ async function handleSearch(query) {
 }
 
 async function addToQueue(externalId) {
+  if (spotifyRateLimited.value) return;
   if (!sessionId.value) {
     showToast('No active session');
     return;
@@ -1115,6 +1163,7 @@ async function addToQueue(externalId) {
       quotaNow.value = Date.now();
     }
   } catch (err) {
+    if (recordSpotifyRateLimit(err)) return;
     showToast(err.detail || 'Failed to add song');
     if (isGuest?.value && err.status === 429) {
       guestRetryUntil.value = Date.now() + Math.max(0, err.retryAfter || 0) * 1000;
@@ -1149,6 +1198,7 @@ async function voteSkip(queueItemId) {
       hasVotedSkip.value = true;
     }
   } catch (err) {
+    if (recordSpotifyRateLimit(err)) return;
     // The server enforces its own cooldown and returns 429 with retry_after.
     if (err.status === 429) {
       const seconds = Math.ceil(err.retryAfter || 0) || 1;
@@ -1163,6 +1213,7 @@ async function voteSkip(queueItemId) {
 }
 
 async function togglePlayPause() {
+  if (!isManager.value || spotifyRateLimited.value) return;
   try {
     if (isPlaying.value) {
       await apiPost('/playback/pause');
@@ -1175,7 +1226,7 @@ async function togglePlayPause() {
 }
 
 async function resumePlayback() {
-  if (!isManager.value || resuming.value) return;
+  if (!isManager.value || spotifyRateLimited.value || resuming.value) return;
   if (queueItems.value.length === 0) {
     showEmptyQueuePrompt.value = true;
     return;
@@ -1199,6 +1250,7 @@ async function resumePlayback() {
 }
 
 async function hostSkip() {
+  if (!isManager.value || spotifyRateLimited.value) return;
   try {
     await apiPost('/playback/skip');
   } catch (err) {
@@ -1207,6 +1259,7 @@ async function hostSkip() {
 }
 
 function handlePlaybackError(err) {
+  if (recordSpotifyRateLimit(err)) return;
   if (err.code === 'SPOTIFY_AUTH_REQUIRED') {
     spotifyPlaybackRequired.value = true;
     spotifyConnectionKnown.value = true;
@@ -1215,6 +1268,20 @@ function handlePlaybackError(err) {
   }
   const msg = err.detail || 'Playback control failed';
   showToast(msg);
+}
+
+function applySpotifyCooldown(retryAt, retryAfter) {
+  const timestamp = Date.parse(retryAt);
+  const deadline = Number.isFinite(timestamp) ? timestamp - (serverClockOffset?.value || 0) : 0;
+  const relative = Number.isFinite(Number(retryAfter)) ? Date.now() + Math.max(0, Number(retryAfter)) * 1000 : 0;
+  spotifyRetryUntil.value = Math.max(spotifyRetryUntil.value, deadline, relative);
+  quotaNow.value = Date.now();
+}
+
+function recordSpotifyRateLimit(err) {
+  if (err.code !== 'SPOTIFY_RATE_LIMITED') return false;
+  applySpotifyCooldown(err.retryAt, err.retryAfter);
+  return true;
 }
 
 function setupWebSocket() {
@@ -1231,6 +1298,11 @@ function setupWebSocket() {
     } else {
       loadQueue();
     }
+  });
+
+  register('spotify_rate_limited', (msg) => {
+    const state = msg.payload || msg;
+    applySpotifyCooldown(state.retry_at, state.retry_after);
   });
 
   register('song_changed', async () => {

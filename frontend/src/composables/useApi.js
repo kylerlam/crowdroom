@@ -49,6 +49,7 @@ export async function apiRequest(method, path, body = null, options = {}) {
     error.detail = data.detail;
     error.code = data.code;
     error.retryAfter = data.retry_after;
+    error.retryAt = data.retry_at;
     throw error;
   }
 

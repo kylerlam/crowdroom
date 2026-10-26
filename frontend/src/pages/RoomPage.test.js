@@ -22,6 +22,7 @@ vi.mock('vue-router', () => ({
   onBeforeRouteLeave: vi.fn(),
 }));
 vi.mock('../components/ThemeToggle.vue', () => ({ default: { template: '<span />' } }));
+vi.mock('qrcode', () => ({ default: { toCanvas: vi.fn().mockResolvedValue() } }));
 vi.mock('../composables/useAuth.js', async () => {
   const { ref } = await import('vue');
   mocks.isGuest = ref(false);
@@ -55,6 +56,7 @@ let authorized;
 let devices;
 let selectedDeviceId;
 let admissions;
+let rateLimitUntil;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -70,14 +72,15 @@ beforeEach(() => {
   devices = [{ id: 'desktop', name: 'Desktop', type: 'computer', is_active: true, is_restricted: false }];
   selectedDeviceId = 'desktop';
   admissions = [];
+  rateLimitUntil = null;
   mocks.apiGet.mockImplementation(async (path) => {
-    if (path === '/playback/spotify/status') return { authorized };
+    if (path === '/playback/spotify/status') return { authorized, rate_limit_until: rateLimitUntil };
     if (path === '/playback/devices') return { devices, selected_device_id: selectedDeviceId };
     if (path === '/platform-connections/spotify/has-app-credentials') return { has_credentials: true };
     if (path === '/rooms/room') return room;
     if (path === '/rooms/room/admissions') return admissions;
     if (path === '/session/by-room/room') return { id: 'session' };
-    if (path === '/rooms/room/playback') return { status: 'stopped' };
+    if (path === '/rooms/room/playback') return { status: 'stopped', rate_limit_until: rateLimitUntil };
     if (path === '/queue/current?session_id=session') return null;
     if (path === '/queue/?session_id=session') return pending;
     if (path === '/rooms/room/members') {
@@ -97,6 +100,72 @@ async function renderRoom() {
   await flushPromises();
   return wrapper;
 }
+
+describe('LAN invite links', () => {
+  const url = 'http://192.168.1.165:3323/invite?token=server-generated-token';
+  let clipboardDescriptor;
+  let execDescriptor;
+
+  beforeEach(() => {
+    clipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, 'clipboard');
+    execDescriptor = Object.getOwnPropertyDescriptor(document, 'execCommand');
+    mocks.apiPost.mockResolvedValue({ url });
+  });
+
+  afterEach(() => {
+    if (clipboardDescriptor) Object.defineProperty(navigator, 'clipboard', clipboardDescriptor);
+    else delete navigator.clipboard;
+    if (execDescriptor) Object.defineProperty(document, 'execCommand', execDescriptor);
+    else delete document.execCommand;
+  });
+
+  async function openInvite() {
+    await renderRoom();
+    document.body.appendChild(wrapper.element);
+    await wrapper.get('[title="Show invite QR"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.qr-link').text()).toBe(url);
+    const button = wrapper.findAll('button').find((item) => item.text() === 'Copy link');
+    button.element.focus();
+    return button;
+  }
+
+  it('copies the exact server sharing URL on HTTP without Clipboard API', async () => {
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true });
+    const copy = vi.fn(() => {
+      expect(document.querySelector('textarea').value).toBe(url);
+      return true;
+    });
+    Object.defineProperty(document, 'execCommand', { value: copy, configurable: true });
+    const button = await openInvite();
+    await button.trigger('click');
+    expect(copy).toHaveBeenCalledExactlyOnceWith('copy');
+    expect(mocks.showToast).toHaveBeenCalledWith('Link copied');
+    expect(document.querySelector('textarea')).toBeNull();
+    expect(document.activeElement).toBe(button.element);
+  });
+
+  it('falls back after Clipboard API access is denied', async () => {
+    const writeText = vi.fn().mockRejectedValue(new Error('Denied'));
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+    Object.defineProperty(document, 'execCommand', { value: vi.fn().mockReturnValue(true), configurable: true });
+    await (await openInvite()).trigger('click');
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledExactlyOnceWith(url);
+    expect(mocks.showToast).toHaveBeenCalledWith('Link copied');
+    expect(document.querySelector('textarea')).toBeNull();
+  });
+
+  it('does not report success when both clipboard methods are denied', async () => {
+    Object.defineProperty(navigator, 'clipboard', { value: undefined, configurable: true });
+    Object.defineProperty(document, 'execCommand', { value: vi.fn().mockReturnValue(false), configurable: true });
+    await (await openInvite()).trigger('click');
+    expect(mocks.showToast).not.toHaveBeenCalledWith('Link copied');
+    expect(mocks.showToast).toHaveBeenCalledWith('Could not copy link. Select the link and copy it manually.');
+    expect(wrapper.get('.qr-link').text()).toBe(url);
+    expect(document.querySelector('textarea')).toBeNull();
+  });
+});
 
 describe('guest song requests', () => {
   async function renderGuest(availableAfterSeconds = 300) {
@@ -425,6 +494,18 @@ describe('queue priority controls', () => {
 
 
 describe('Spotify manager status and devices', () => {
+  it('shows devices only when a user is the host of the current room', async () => {
+    mocks.userId.value = 'another-room-owner';
+    await renderRoom();
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/devices');
+    wrapper.unmount();
+    room.host_user_id = 'another-room-owner';
+    await renderRoom();
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(true);
+    expect(mocks.apiGet).toHaveBeenCalledWith('/playback/devices');
+  });
+
   it('shows the room host authorization status to administrators', async () => {
     mocks.userId.value = 'admin';
     await renderRoom();
@@ -484,5 +565,90 @@ describe('Spotify manager status and devices', () => {
     await flushPromises();
     expect(wrapper.get('#spotify-device').element.value).toBe('desktop');
     expect(wrapper.find('.spotify-device-help').exists()).toBe(false);
+  });
+});
+
+describe('Spotify shared request cooldown', () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+
+  it('hydrates the cooldown without probing devices and re-enables controls after the deadline', async () => {
+    mocks.apiPost.mockResolvedValue({});
+    rateLimitUntil = new Date(Date.now() + 120000).toISOString();
+    pending = [{ id: 'item', song: { id: 'song', title: 'Queued song' } }];
+    await renderRoom();
+    expect(wrapper.get('.spotify-cooldown').text()).toContain('2:00');
+    expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
+    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('.spotify-device-controls button').attributes('disabled')).toBeDefined();
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/devices');
+    const requestCount = mocks.apiGet.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(wrapper.get('.spotify-cooldown').text()).toContain('1:00');
+    expect(mocks.apiGet).toHaveBeenCalledTimes(requestCount);
+    await vi.advanceTimersByTimeAsync(60000);
+    expect(wrapper.find('.spotify-cooldown').exists()).toBe(false);
+    expect(wrapper.get('[title="Resume playback"]').attributes('disabled')).toBeUndefined();
+    expect(mocks.apiPost).not.toHaveBeenCalled();
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    await flushPromises();
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+  });
+
+  it('turns a rejected Resume into one shared countdown without follow-up device requests', async () => {
+    pending = [{ id: 'item', song: { id: 'song', title: 'Queued song' } }];
+    await renderRoom();
+    const deviceRequests = mocks.apiGet.mock.calls.filter(([path]) => path === '/playback/devices').length;
+    mocks.apiPost.mockRejectedValue({ code: 'SPOTIFY_RATE_LIMITED', status: 429, retryAfter: 22699 });
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    await flushPromises();
+    expect(wrapper.get('.spotify-cooldown').text()).toContain('6:18:19');
+    expect(wrapper.find('[aria-label="Spotify connected"]').exists()).toBe(true);
+    expect(wrapper.find('[aria-label="Spotify disconnected"]').exists()).toBe(false);
+    expect(mocks.apiGet.mock.calls.filter(([path]) => path === '/playback/devices')).toHaveLength(deviceRequests);
+    await wrapper.get('[title="Resume playback"]').trigger('click');
+    expect(mocks.apiPost).toHaveBeenCalledOnce();
+  });
+
+  it.each(['admin', 'guest'])('shares availability with %s without revealing playback devices', async (actor) => {
+    mocks.userId.value = actor;
+    rateLimitUntil = new Date(Date.now() + 60000).toISOString();
+    await renderRoom();
+    expect(wrapper.find('.spotify-cooldown').exists()).toBe(true);
+    expect(wrapper.find('.spotify-device-panel').exists()).toBe(false);
+    expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/devices');
+    if (actor === 'guest') {
+      expect(wrapper.find('.spotify-status').exists()).toBe(false);
+      expect(mocks.apiGet).not.toHaveBeenCalledWith('/playback/spotify/status');
+    }
+  });
+
+  it('updates open members from the shared cooldown event without polling Spotify', async () => {
+    mocks.userId.value = 'guest';
+    await renderRoom();
+    const requests = mocks.apiGet.mock.calls.length;
+    mocks.handlers.get('spotify_rate_limited')({ retry_at: new Date(Date.now() + 90000).toISOString(), retry_after: 90 });
+    await flushPromises();
+    expect(wrapper.get('.spotify-cooldown').text()).toContain('1:30');
+    expect(wrapper.get('[placeholder="Search for songs..."]').attributes('disabled')).toBeDefined();
+    expect(mocks.apiGet).toHaveBeenCalledTimes(requests);
+  });
+
+  it('handles search limits separately from a guest request allowance', async () => {
+    mocks.isGuest.value = true;
+    mocks.userId.value = 'guest';
+    mocks.guestRequestAvailableAt.value = new Date(Date.now() - 1000).toISOString();
+    const defaultGet = mocks.apiGet.getMockImplementation();
+    mocks.apiGet.mockImplementation(async (path) => {
+      if (path.startsWith('/search/?')) throw { code: 'SPOTIFY_RATE_LIMITED', status: 429, retryAfter: 120 };
+      return defaultGet(path);
+    });
+    await renderRoom();
+    await wrapper.get('[placeholder="Search for songs..."]').setValue('Song');
+    await vi.advanceTimersByTimeAsync(300);
+    await flushPromises();
+    expect(wrapper.get('.spotify-cooldown').text()).toContain('2:00');
+    expect(wrapper.get('.guest-request-notice').text()).toContain('You can request a song now');
+    expect(mocks.apiPost).not.toHaveBeenCalled();
   });
 });

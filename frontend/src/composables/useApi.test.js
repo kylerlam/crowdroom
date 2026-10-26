@@ -124,4 +124,16 @@ describe('apiRequest', () => {
       retryAfter: 2,
     });
   });
+
+  it('preserves Spotify cooldown code and its absolute deadline', async () => {
+    vi.stubGlobal('fetch', mockFetch({ status: 429, ok: false, body: {
+      code: 'SPOTIFY_RATE_LIMITED', detail: 'Spotify is temporarily rate limited.',
+      retry_after: 120, retry_at: '2026-10-26T12:00:00Z',
+    } }));
+    await expect(apiPost('/playback/play')).rejects.toMatchObject({
+      code: 'SPOTIFY_RATE_LIMITED', retryAfter: 120, retryAt: '2026-10-26T12:00:00Z',
+    });
+    expect(clearAuth).not.toHaveBeenCalled();
+    expect(push).not.toHaveBeenCalled();
+  });
 });
